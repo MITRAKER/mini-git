@@ -176,6 +176,15 @@ func remove(t *testing.T, path string) {
 	}
 }
 
+// removeAll deletes a folder and everything in it, failing the test if it
+// cannot.
+func removeAll(t *testing.T, path string) {
+	t.Helper()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // chmod changes a file's permissions, failing the test if it cannot.
 func chmod(t *testing.T, path string, mode os.FileMode) {
 	t.Helper()

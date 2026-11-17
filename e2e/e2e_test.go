@@ -136,6 +136,16 @@ func TestStatusMatchesGit(t *testing.T) {
 
 	mgit(t, dir, "add", ".")
 	check("everything staged")
+
+	// A tracked folder replaced by a file, and a tracked file replaced by a
+	// folder: Git reports the old paths as deleted and the new ones as
+	// untracked.
+	git(t, dir, "commit", "-q", "-m", "second")
+	removeAll(t, filepath.Join(dir, "brand-new-dir"))
+	writeFile(t, dir, "brand-new-dir", "now a file\n", 0o644)
+	remove(t, filepath.Join(dir, "keep.txt"))
+	writeFile(t, dir, "keep.txt/inner.txt", "now a folder\n", 0o644)
+	check("file and folder swapped")
 }
 
 func TestCommandsWorkFromASubfolder(t *testing.T) {

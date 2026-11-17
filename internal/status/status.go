@@ -220,6 +220,11 @@ func (w *untrackedWalker) visit(dir string) error {
 			}
 		case w.tracked[child]:
 			w.stack = append(w.stack, child)
+		case w.ix.Get(child) != nil:
+			// A folder that replaced a tracked file: its name is still in
+			// the index, and Git does not list such a folder (only
+			// `git status -uall` shows the files inside it).
+			continue
 		case hasFiles(w.r, child):
 			w.found = append(w.found, child+"/")
 		}
