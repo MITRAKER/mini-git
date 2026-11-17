@@ -111,10 +111,12 @@ Run `make help` to print this list in your terminal.
 | `make cover` | Measures test coverage, including the end-to-end tests, and prints the total. |
 | `make lint` | Runs golangci-lint with the settings in `.golangci.yml`. |
 | `make fmt` | Formats the Go code. |
+| `make fmt-check` | Fails if any Go file is not formatted (what CI checks). |
 | `make vet` | Runs `go vet`. |
 | `make vuln` | Runs govulncheck to look for known vulnerabilities. |
 | `make tidy` | Runs `go mod tidy`. |
-| `make check` | Runs everything CI runs: the format check, vet, lint, the tests with `-race`, the coverage threshold and govulncheck. Run it before you push. |
+| `make tidy-check` | Fails if `go.mod` or `go.sum` is not tidy (what CI checks). |
+| `make check` | Runs everything CI runs: the format check, vet, lint, the tests with `-race`, the coverage threshold, govulncheck and the `go mod tidy` check. Run it before you push. |
 | `make hooks` | Installs the pre-commit hooks. |
 | `make dist` | Cross-compiles release binaries into `dist/`. |
 | `make clean` | Removes build and test output. |
@@ -211,8 +213,11 @@ first code change. In short:
 8. **Nothing hidden.** No `unsafe`, no cgo, no reflection. Code for one
    operating system goes only in files with a GOOS build tag, such as
    `internal/index/stat_linux.go`.
-9. **No function values in our own APIs.** Pass a function only as an
-   argument to the standard library, for example to sort a slice.
+9. **No function values in our own APIs:** no callbacks and no fields or
+   maps that hold functions. Choose code with a `switch`, walk with an
+   iterator that has a `Next` method (like `history.Walker`), and sort with a
+   named type that implements `sort.Interface`. Tests may pass function
+   literals to the standard library, for example to `filepath.WalkDir`.
 10. **Zero warnings** from the strictest linters. CI runs golangci-lint with
     the settings in `.golangci.yml` and fails on any finding.
 
@@ -261,7 +266,8 @@ proves that every byte matches.
 **Every behavior change needs an end-to-end test that compares mgit with
 git.** Put it in the file for its build step: `e2e/e2e_test.go` covers
 objects, the index and `status`, and `e2e/history_test.go` covers commits,
-`log` and revision names. A new step gets a new file, such as
+`log` and revision names. `e2e/cli_test.go` covers the command line itself:
+help, version, exit statuses and errors. A new step gets a new file, such as
 `e2e/refs_test.go`.
 
 Build the test from the helpers in
@@ -276,7 +282,15 @@ Build the test from the helpers in
 | `run(t, dir, stdin, prog, args...)` | runs a program with the given standard input |
 | `runEnv(t, dir, env, stdin, prog, args...)` | the same, with extra environment variables |
 | `mgitFails(t, dir, env, args...)` | expects mgit to fail, and returns its error output |
+| `execIn(dir, env, stdin, prog, args...)` | runs a program and returns its output and error, without failing the test (for checking exit statuses) |
 | `at(when)` | environment settings that fix the author and committer date |
+| `remove(t, path)`, `removeAll(t, path)` | deletes a file, or a folder and everything in it |
+| `mkdir(t, path)` | creates a folder and its parents |
+| `chmod(t, path, mode)` | changes a file's permissions |
+| `symlink(t, target, link)` | creates a symbolic link |
+
+Every helper that takes `t` fails the test when its step fails, so a test
+never has to check errors from its own setup.
 
 Then do the same thing with both tools and compare. To compare output, check
 `mgit(...)` against `git(...)` directly, as `TestStatusMatchesGit` does. To

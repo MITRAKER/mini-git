@@ -5,7 +5,7 @@ built, why it was designed that way, and the Git ideas behind it. The goal is
 that after reading a lesson you could rebuild that step yourself.
 
 Every lesson ends with **Try it** commands and a few **Exercises**. Do them in
-a scratch folder. You need Go 1.22+ and the real `git` installed, because the
+a scratch folder. You need Go 1.26+ and the real `git` installed, because the
 best way to understand mgit is to compare it with Git side by side.
 
 ```sh
@@ -19,6 +19,7 @@ Contents
 - [Lesson 1: The object store (`init`, `hash-object`, `cat-file`)](#lesson-1-the-object-store)
 - [Lesson 2: The index and `status` (`add`, `status`, `ls-files`)](#lesson-2-the-index-and-status)
 - [Lesson 3: Commits and history (`commit`, `log`, `rev-parse`)](#lesson-3-commits-and-history)
+- [Lesson 4: Professional engineering (CI/CD, linters, NASA/JPL rules)](#lesson-4-professional-engineering)
 - [How the code is tested](#how-the-code-is-tested)
 
 ---
@@ -144,6 +145,7 @@ Because the name *is* the hash of the content:
 ### 1.4 Writing safely: temp file + rename
 
 ```go
+// The idea, with the error checks left out (the real code checks every one):
 tmp, _ := os.CreateTemp(filepath.Dir(dest), "tmp_obj_")
 tmp.Write(compressed)
 tmp.Close()
@@ -280,8 +282,8 @@ Three details you only learn by building it:
   a truncated or corrupted index is detected instead of silently misread.
 
 Entries are **sorted by path** (byte order). That makes lookups a binary search
-(`sort.Search` in `Index.find`) and lets Git compare the index with a tree by
-walking both lists in order.
+(`Index.find`) and lets Git compare the index with a tree by walking both
+lists in order.
 
 ### 2.4 Writing safely: the lock file
 
@@ -307,8 +309,8 @@ Git complain that `index.lock` exists, this is that mechanism.
 ```
 
 1. **HEAD vs index** (*staged*). Read the commit HEAD points to, flatten its
-   tree into a `path -> hash` map (`flattenTree`, recursive), and compare it
-   with the index. In the index but not HEAD: *new file*. In HEAD but not the
+   tree and all its subtrees into one `path -> hash` map
+   (`history.FlattenTree`), and compare it with the index. In the index but not HEAD: *new file*. In HEAD but not the
    index: *deleted*. Different hash or mode: *modified*.
 2. **Index vs working tree** (*not staged*). For each index entry, look at the
    file on disk. Missing: *deleted*. Otherwise compare contents (see 2.6).
@@ -399,10 +401,17 @@ root tree                         tree for src/
   40000  tree 7d0e4b  src    ──▶    40000  tree e1a9c3  util   ──▶ ...
 ```
 
-Because the index is **sorted**, all paths inside `src/` sit next to each
-other. `writeTree` finds where that run of entries ends and calls itself on
-just that slice. That is a *recursive* function: it solves "write the tree for
-`src/`" by solving the same problem for each subfolder.
+A parent needs its subfolders' hashes before it can be written, so the order
+matters. `WriteTree` first collects every folder name (`src/util`, `src`, and
+`""` for the root) and sorts the list **in reverse**. A parent's name is a
+prefix of its child's name, so it sorts before the child, and reversing the
+list puts every folder before its parent. One plain loop over that list then
+writes the trees, and when a folder's turn comes, all of its subfolders
+already have hashes.
+
+(The first version of `writeTree` called itself once for each subfolder: a
+*recursive* function. [Lesson 4](#44-before-and-after) explains why mgit's
+coding rules replaced it with a loop.)
 
 **The sort-order trap.** Git sorts tree entries by name, but compares a folder
 as if its name ended in `/`. So for a file `a-b`, a file `a.c` and a folder `a`:
@@ -509,10 +518,10 @@ paths split and join again:
          C ←───────
 ```
 
-`history.Walk` starts from HEAD and repeatedly shows the **newest** commit it
-knows about, then adds that commit's parents to the queue. "Newest" means the
-latest committer date, so the queue is a **priority queue**
-(`container/heap`). A `seen` set makes sure a commit reachable along two
+`history.Walker` starts from HEAD. Each call to its `Next` method returns the
+**newest** commit it knows about and adds that commit's parents to the queue.
+"Newest" means the latest committer date, so the queue is a **priority
+queue** (`container/heap`). A `seen` set makes sure a commit reachable along two
 paths (like `B` above) is shown only once. This gives the same order as
 `git log`, which the tests check on a history with a merge.
 
@@ -593,32 +602,482 @@ mgit commit-tree -m "same" $tree   # the same hash
 6. Harder: add `--amend`. It is a commit whose parents are the *current
    commit's* parents instead of the current commit.
 
+---
+
+## Lesson 4: Professional engineering
+
+**Commands:** `make help`, `make check`, `make cover`, `make dist`, `mgit version`
+**Code:** [`.github/workflows/`](.github/workflows), [`Makefile`](Makefile), [`.golangci.yml`](.golangci.yml), [`internal/bounded/`](internal/bounded), [`cmd/mgit/output.go`](cmd/mgit/output.go)
+**Rules:** [`docs/CODING_STANDARD.md`](docs/CODING_STANDARD.md)
+
+Lessons 1 to 3 were about what mgit does. This lesson is about how a project
+*keeps* working as it grows: machines that check every change, coding rules
+that keep the code simple enough to check, and releases that nobody has to
+make by hand.
+
+On a healthy repository, mgit prints exactly what it printed before. What
+changed is how it behaves on a broken or hostile repository, and how fast a
+mistake is caught. Along the way, the new checks found six real bugs
+(section 4.5).
+
+### 4.1 Continuous integration: machines check every change
+
+**Continuous integration (CI)** means every change is built and tested
+automatically *before* it is merged, so `main` always works. **Continuous
+delivery (CD)** goes one step further: publishing a release is automatic too.
+mgit uses GitHub Actions for both. A *workflow* is a YAML file in
+`.github/workflows/`. GitHub reads it, and when one of the events it lists
+happens (a push, a pull request, a schedule), it runs the workflow's *jobs* on
+fresh virtual machines.
+
+```
+ on your machine                          on GitHub
+ ───────────────                          ─────────
+ git commit ─▶ pre-commit hooks           pull request ─▶ CI, CodeQL, dependency review
+               (gofmt, vet, lint)                           │ all green
+ git push ───▶ pre-push hook (tests)                        ▼
+ make check  = everything CI runs                         merge ─▶ tag v0.1.0
+                                                                      │
+                                          Release workflow ◀──────────┘
+                                          (binaries, checksums, release notes)
+
+ every week: Dependabot (updates), CodeQL (security), OpenSSF Scorecard (practices)
+```
+
+Here is the test job of [`ci.yml`](.github/workflows/ci.yml), trimmed a little:
+
+```yaml
+on:
+  push:
+    branches: [main]
+  pull_request:                 # every pull request, whatever branch it targets
+
+permissions:
+  contents: read                # the jobs may read the code, nothing more
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: [oldstable, stable] # the two supported Go releases
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: make race
+```
+
+A `matrix` runs the same job once for every combination: 2 systems times 2 Go
+versions is 4 runs, so a bug that only shows up on macOS, or only with the
+older Go, is caught too. Each `uses:` line runs a ready-made *action*: one
+checks out the code, the next installs Go. The CI workflow has five jobs:
+
+| Job | Runs | Catches |
+|-----|------|---------|
+| Lint | `gofmt`, `go vet`, `go mod tidy -diff`, golangci-lint | unformatted code, suspicious code, broken coding rules |
+| Test | the unit and end-to-end tests with `-race`, 4 times | wrong behavior, data races, differences between systems |
+| Coverage | `make cover` | code that no test runs; fails below 80% |
+| govulncheck | `make vuln` | known vulnerabilities in code that mgit calls |
+| Cross-compile | `make dist` | code that does not build for Windows, macOS or arm64 |
+
+**Every job is a `make` target.** CI runs `make race`, and so can you. The
+[Makefile](Makefile) is the single place that says how to build, test and
+check mgit, and `make check` runs everything CI runs. So "it passes on my
+machine" means it will pass in CI too.
+
+**The pipeline must be safe as well**, because it runs the code of every pull
+request, from anyone. So the workflows follow a few rules:
+
+- **Least privilege.** `permissions: contents: read` gives a job's GitHub
+  token read access only. The one job that must write (publishing a release)
+  asks for that one permission, in that one job.
+- **No stored token.** By default `actions/checkout` leaves the token in
+  `.git/config`, where every later step could read it.
+  `persist-credentials: false` says not to.
+- **Pinned tool versions.** golangci-lint `v2.15.0` and govulncheck `v1.9.0`
+  are fixed versions, so a new release of a tool cannot break the build
+  overnight. Updates arrive as pull requests from Dependabot, where CI checks
+  them first.
+- **No untrusted text in scripts.** Anyone can choose a pull request's title
+  or branch name. Pasted into a `run:` script with `${{ ... }}`, it could
+  inject shell commands, so the workflows never do that.
+
+### 4.2 The tools, one by one
+
+**gofmt and goimports: one format for everyone.** Go has one official
+format, so nobody argues about spaces, and a diff shows only real changes.
+goimports also sorts the imports: the standard library first, then mgit's own
+packages. `make fmt` formats; CI fails on any file that is not formatted.
+
+**go vet: a second opinion after the compiler.** It reports code that
+compiles but is almost certainly wrong, such as a `Printf` whose arguments
+do not match its `%` verbs.
+
+**golangci-lint: forty linters, one configuration.** A *linter* reads code
+and reports problems without running it. [`.golangci.yml`](.golangci.yml)
+turns on about 40 of them, each tagged with the coding rule it supports
+(section 4.3). Some examples:
+
+| Linter | Reports |
+|--------|---------|
+| `errcheck` | an `error` that is never checked |
+| `gosec` | security problems, such as file permissions that are too open |
+| `funlen`, `gocyclo`, `gocognit` | functions too long or too complex to review |
+| `gochecknoglobals` | package-level variables that any function can change |
+| `staticcheck` | hundreds of checks for bugs, dead code and simpler forms |
+| `revive` | missing documentation, badly written error messages, naming |
+| `nolintlint` | a `//nolint` comment that does not name the linter and say why |
+
+The first run reported **99 findings**. Fixing them, rather than silencing
+them, is most of what this step changed in the code.
+
+**The race detector.** `go test -race` makes Go watch every memory access
+while the tests run, and fail if two goroutines use the same memory without
+synchronizing. mgit runs everything in one goroutine today, so this is
+insurance: the day someone adds concurrency, the check is already on.
+
+**Coverage: which code did the tests run?** Coverage is the share of
+statements that ran at least once during the tests. A high number does not
+prove the code is right, but code with no coverage has never been tested at
+all. mgit has a twist: its end-to-end tests run the `mgit` *binary* in
+another process, and `go test -cover` only sees the test process. Go 1.20
+added the answer:
+
+```sh
+go build -cover -o mgit ./cmd/mgit       # a binary that records what it runs...
+GOCOVERDIR=/tmp/cov ./mgit status        # ...into this folder, when it exits
+go tool covdata percent -i=/tmp/cov      # read it back
+```
+
+`e2e/helpers_test.go` builds mgit with `-cover` when `GOCOVERDIR` is set, and
+`make cover` merges both kinds of tests into one number:
+
+```
+unit tests  go test -cover ... -args -test.gocoverdir=coverage/unit ──┐
+e2e tests   GOCOVERDIR=coverage/e2e go test ./e2e/ ───────────────────┴─▶ go tool covdata ─▶ total
+```
+
+The total is about 87%, and CI fails below 80%. Why not demand 100%? Some
+error paths run only when, say, the disk fails halfway through a write, and
+faking that takes more code than the error path itself. A floor stops
+coverage from sliding down without forcing tests that test nothing.
+
+**govulncheck: known vulnerabilities, without false alarms.** It checks the
+code and the Go version against the Go vulnerability database. Unlike most
+scanners, it reports a vulnerability only when mgit actually *calls* the
+affected function, because it follows the call graph. mgit uses only Go's
+standard library, so a finding would be in Go itself, and the fix would be a
+newer Go.
+
+**CodeQL** is GitHub's code scanner. It turns the code into a database and
+runs security queries over it, such as "can text from a file reach the path
+of a file that is opened?". It runs on every pull request and every week, and
+its alerts appear in the repository's Security tab.
+
+**Dependency review and Dependabot.** Dependency review fails a pull request
+that adds a dependency with a known vulnerability. Dependabot looks for new
+versions of the Go modules and the GitHub Actions every week, and opens a
+pull request when it finds some. mgit has no dependencies outside Go's
+standard library, and that is a choice: every dependency is code you run
+without having read it.
+
+**OpenSSF Scorecard** grades the project's security practices (code review,
+branch protection, token permissions, pinned dependencies, and more) every
+week, and publishes the score that the README's badge shows.
+
+**pre-commit** runs the quick checks before each commit and the tests before
+each push, so you hear about a problem in seconds, on your machine, instead
+of minutes later from CI. Install it with `make hooks`.
+
+**Releases.** mgit's versions follow [Semantic Versioning](https://semver.org/)
+(`v0.1.0`: major, minor, patch), and [CHANGELOG.md](CHANGELOG.md) collects
+every user-visible change. Pushing a tag such as `v0.1.0` starts
+[`release.yml`](.github/workflows/release.yml): it runs the tests, builds
+mgit for six platforms with the version stamped into the binary
+(`-ldflags "-X main.version=v0.1.0"`, which `mgit version` prints), writes
+SHA-256 checksums so downloads can be verified, and publishes a GitHub Release
+whose notes are that version's section of the changelog.
+
+### 4.3 The NASA/JPL "Power of Ten"
+
+In 2006 Gerard Holzmann, at NASA's Jet Propulsion Laboratory (JPL),
+published ten rules for code that must not fail, like the software that flies
+spacecraft. The rules are short on purpose: few enough to remember, and
+simple enough for a tool to check. They were written for C, so mgit follows a
+Go version of them, explained rule by rule in
+[docs/CODING_STANDARD.md](docs/CODING_STANDARD.md):
+
+| # | Holzmann's rule, in short | mgit's Go version |
+|---|---------------------------|-------------------|
+| 1 | Simple control flow, no recursion | trees, folders and history are walked with loops |
+| 2 | Every loop has a fixed upper bound | a named limit on every loop over input |
+| 3 | No dynamic memory after startup | every size that comes from input is checked before allocating |
+| 4 | A function fits on one page | at most 60 lines and 40 statements |
+| 5 | Assertions in every function | check what must be true, and return an error if it is not |
+| 6 | Smallest possible scope | no package-level variables that can change |
+| 7 | Check every return value | every error, including errors from printing |
+| 8 | Limit the preprocessor | no `unsafe`, cgo or reflection |
+| 9 | Restrict pointers | no function values in mgit's own APIs |
+| 10 | Zero warnings from strict tools | any linter finding fails CI |
+
+**Why would a Git clone follow spacecraft rules?** Because mgit reads input
+it cannot trust. A repository can be damaged by a crash or a bad disk, or
+built on purpose by someone who wants to break the tools that read it. Every
+object, index entry, ref and config line is input. Without the rules, mgit is
+correct on repositories that are correct. With them, it behaves well on any
+repository, and the worst case is a clear error message.
+
+### 4.4 Before and after
+
+**No recursion (rule 1).** The first `writeTree` (lesson 3.1) called itself
+for each subfolder:
+
+```go
+// Before: write the subfolder's tree by calling ourselves on its entries.
+h, err := writeTree(store, entries[i:j], subPrefix)
+```
+
+With recursion, the *input* decides how deep the calls go and how much stack
+memory they use, and there is no number in the code that a check could
+compare it with. Go grows a goroutine's stack as needed, up to 1 GB on a
+64-bit system, but running out is a fatal error that not even `recover` can
+catch. The new
+`WriteTree` needs no stack at all, thanks to the reverse sort from lesson 3.1:
+
+```go
+// After: every folder comes before its parent ("src/util" > "src" > ""),
+// so one loop writes them all, deepest first.
+sort.Sort(sort.Reverse(sort.StringSlice(folders.list)))
+for _, dir := range folders.list {
+	... // this folder's files, plus its subfolders' hashes, become one tree
+}
+```
+
+`FlattenTree`, which reads trees back, keeps an explicit stack of trees still
+to read: the loop takes one off, reads it, and pushes its subfolders. Depth is
+now just data, and the code checks it against a limit, `maxTreeDepth = 4096`,
+the default of Git's own limit, `core.maxTreeDepth`.
+
+**Bounded loops (rule 2).** A symbolic ref can point to another one, which
+can point back:
+
+```sh
+echo "ref: refs/heads/b" > .git/refs/heads/a
+echo "ref: refs/heads/a" > .git/refs/heads/b
+echo "ref: refs/heads/a" > .git/HEAD
+mgit rev-parse HEAD
+# mgit rev-parse: ref refs/heads/a: more than 5 levels of symbolic refs
+```
+
+A loop that follows links "until it finds a hash" would run forever here.
+`repo.ResolveRef` stops after `maxSymrefDepth = 5` links, Git's limit too.
+Every loop in mgit either ranges over data already in memory, or has a named
+limit like this one; the coding standard lists them all in a table.
+
+**Bounded memory (rule 3): the zlib bomb.** zlib compresses repetitive data
+extremely well: 500 MB of zeros shrink to half a megabyte. The old
+`Store.Read` decompressed with `io.ReadAll`, which keeps reading as long as
+data comes out, and checked the header's size only afterwards. So a 0.5 MB
+object file whose header says `blob 5` made the old mgit use **1.1 GB of
+memory** before it reported the object as corrupt. Now `decode` reads the
+header first and checks the size it claims before allocating anything:
+
+```go
+t, size, err := readHeader(zr)                           // at most 32 bytes
+if int64(size) > int64(len(compressed))*maxDeflateRatio { // zlib's best is about 1032:1
+	return ... // "header claims %d bytes, more than %d compressed bytes can hold"
+}
+data := make([]byte, size) // parseHeader already refused sizes over object.MaxSize (1 GiB)
+_, err = io.ReadFull(zr, data)
+// ... then read one more byte: if there is one, "content is longer than its header says"
+```
+
+The same file now costs 12 MB of memory and gives a clear error. Every other
+file mgit reads (refs, config, the index, the files you `add`) goes through
+the small package `internal/bounded`, built on one trick: to read at most
+`limit` bytes, ask for `limit+1`. If you get them, the input is too big.
+
+```go
+data, err := io.ReadAll(io.LimitReader(r, limit+1))
+...
+if int64(len(data)) > limit {
+	return nil, fmt.Errorf("%s is larger than %d bytes", name, limit)
+}
+```
+
+**Printing can fail (rule 7).** `fmt.Println` returns an error, and almost
+every program ignores it. On Linux, `/dev/full` is a device that fails every
+write with "no space left on device". Before:
+
+```console
+$ mgit log > /dev/full; echo "exit $?"
+exit 0
+```
+
+The output was lost, and mgit said it succeeded. A script that saves
+`mgit log` to a file on a full disk would never know. After:
+
+```console
+$ mgit log > /dev/full; echo "exit $?"
+mgit log: write /dev/stdout: no space left on device
+exit 1
+```
+
+Commands now print through a small `output` type
+([`cmd/mgit/output.go`](cmd/mgit/output.go)). It buffers what is printed,
+remembers the first error, and returns it from `flush` when the command ends,
+so one check covers every line.
+
+**No hidden indirection (rule 9).** Commands used to be looked up in a map
+of functions, and `log` passed a callback to `history.Walk`. Both hide which
+code runs next, from readers and from tools. Now a `switch` picks the command
+(`dispatch` in [`cmd/mgit/main.go`](cmd/mgit/main.go)), and `log` asks a
+`history.Walker` for one commit at a time, in an ordinary bounded loop:
+
+```go
+for shown := range limit {
+	h, c, ok, err := w.Next()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // no more commits
+	}
+	... // print the commit
+}
+```
+
+### 4.5 Bugs the new checks found
+
+Turning on strict checks in an existing project always finds something.
+These are the six real bugs, and what caught each one:
+
+1. **`status` failed when a tracked folder became a file.** Track `d/x.txt`,
+   then delete the folder `d` and create a file named `d`. Asking the system
+   about `d/x.txt` now fails with "not a directory" (`ENOTDIR`), not "no such
+   file", and mgit treated it as a real error:
+   `mgit status: lstat .../d/x.txt: not a directory`. Git says ` D d/x.txt`
+   (deleted). A new end-to-end test, written to raise coverage, found it.
+   `repo.StatTracked` now handles it for `status`, `add` and `commit -a`.
+2. **A Git quirk, found by differential testing.** The same test also
+   replaced the tracked file `keep.txt` with a folder `keep.txt/`. mgit listed
+   `?? keep.txt/` as untracked, and Git did not: Git does not list an
+   untracked folder while a file of the same name is still in the index (with
+   `-uall` it lists the files inside). The answer key decides, so mgit now
+   does the same.
+3. **`hash-object` stored broken objects.** `printf garbage | mgit
+   hash-object -t tree --stdin` printed a hash, and with `-w` it would have
+   stored a tree that nothing can read. Git refuses: `fatal: refusing to
+   create malformed object`. Now `object.Check` parses a tree, commit or tag
+   before hashing it.
+4. **The wrong exit status for usage errors.** Git exits with status 129
+   when a command is called the wrong way, and scripts rely on that; mgit
+   exited with 1. The new tests in `e2e/cli_test.go` compare it with Git.
+5. **Lost output reported as success** (`/dev/full`, in 4.4).
+6. **The zlib bomb** (in 4.4).
+
+None of these needed an exotic tool. Each was found by making a rule
+explicit (check every error, bound every allocation) and then writing the
+test that holds the code to it.
+
+### Try it
+
+```sh
+make help                      # every target, with a description
+make check                     # everything CI runs (needs golangci-lint and govulncheck)
+make cover                     # coverage of the unit and end-to-end tests together
+go tool cover -html=coverage/coverage.out   # every line, green if a test ran it
+make dist && ls dist/          # binaries for 6 platforms, and SHA256SUMS
+make build && ./mgit version
+
+# Printing can fail (Linux only)
+mgit log > /dev/full; echo "exit $?"
+
+# A loop of symbolic refs: an error, not a hang
+mkdir loop && cd loop && mgit init
+echo "ref: refs/heads/b" > .git/refs/heads/a
+echo "ref: refs/heads/a" > .git/refs/heads/b
+echo "ref: refs/heads/a" > .git/HEAD
+mgit rev-parse HEAD
+git rev-parse HEAD             # Git refuses too
+```
+
+To build the zlib bomb from 4.4 yourself, run this in a repository. It
+writes the object straight into `.git/objects`, under a made-up name:
+
+```sh
+python3 - <<'PY'
+import os, zlib
+z = zlib.compressobj(9)
+data = z.compress(b"blob 5\0hello")
+for _ in range(500):
+    data += z.compress(bytes(1 << 20))   # 500 MB of zeros
+data += z.flush()
+os.makedirs(".git/objects/ef", exist_ok=True)
+open(".git/objects/ef/" + "01" * 19, "wb").write(data)
+print(len(data), "bytes on disk")
+PY
+mgit cat-file -p ef0101        # corrupt: content is longer than its header says
+```
+
+### Exercises
+
+1. Break a rule on purpose: add `panic("todo")` to any function, or make one
+   longer than 60 lines, then run `make lint`. Which linter complains, and
+   what does it say? Undo the change.
+2. Open the coverage report in your browser and find a red line (never run)
+   in `internal/`. Write a test that runs it, then run `make cover` again.
+3. Make the bomb honest: write the header `blob 524288005` (500 MB of zeros
+   plus `hello`), and save the file under its real name, the SHA-1 of
+   everything you compressed (Python's `hashlib.sha1` can hash it piece by
+   piece). Now mgit accepts it, and `cat-file -s` prints its size. Why is
+   accepting it right? Which check refuses the same object with 2 GB of
+   zeros?
+4. Find every loop in `internal/revision/revision.go`, and name the limit
+   that stops each one.
+5. Read [`release.yml`](.github/workflows/release.yml). What happens, step
+   by step, when someone pushes the tag `v0.1.0`? What if `CHANGELOG.md` has
+   no `## [0.1.0]` section?
+6. Harder: OpenSSF Scorecard prefers pinning each action to a full commit
+   hash (`actions/checkout@<40 hex characters>`) instead of a tag like `@v4`.
+   Why is a tag weaker? How does Dependabot keep pinned hashes up to date?
 
 ---
 
 ## How the code is tested
 
-There are two layers of tests (`go test ./...`):
+There are two layers of tests (`go test ./...`, or `make test`):
 
 - **Unit tests** next to the code (`*_test.go`) check one piece at a time:
   known hashes, round-tripping an object or an index through write and read,
-  padding, lock files.
+  padding, lock files, and corrupt input of every kind.
 - **End-to-end tests** in [`e2e/`](e2e/e2e_test.go) build the real `mgit`
   binary, run it in temporary folders, and **compare its output with real Git**
   on the same repository. For example, `TestStatusMatchesGit` creates edits,
-  deletions, permission changes and untracked folders, then checks that
-  `mgit status --short` prints exactly what `git status --porcelain` prints.
-  `TestCommitsAreByteForByteIdenticalToGit` goes furthest: it makes the same
-  commits with Git and with mgit and requires **identical commit hashes**,
-  which proves every byte of every blob, tree and commit matches.
+  deletions, permission changes, untracked folders and files swapped with
+  folders, then checks that `mgit status --short` prints exactly what
+  `git status --porcelain` prints. `TestCommitsAreByteForByteIdenticalToGit`
+  goes furthest: it makes the same commits with Git and with mgit and
+  requires **identical commit hashes**, which proves every byte of every blob,
+  tree and commit matches.
 
 Using an existing, trusted program as the answer key is called *differential
 testing* (or using a "test oracle"). It is how you test a re-implementation:
 you do not need to work out the right answer by hand, you only need to agree
-with Git. GitHub Actions runs all of it on Linux and macOS for every push
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+with Git.
+
+GitHub Actions runs all of it on every pull request, on Linux and macOS, with
+the race detector, and measures coverage across both layers
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml), explained in
+[lesson 4](#lesson-4-professional-engineering)). `make check` runs the same
+checks on your machine.
 
 ---
 
-*Next: making the repository professional (CI/CD, linters, security
-scanning and NASA/JPL coding rules), then `branch` and `checkout`.*
+*Next: step 4, branches. `mgit branch` and `mgit checkout`, which finally
+write files back into the working tree.*

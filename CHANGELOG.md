@@ -16,6 +16,7 @@ changes.
   - Objects are stored zlib-compressed and named by their SHA-1 hash, in Git's
     exact format, and written atomically (a temporary file, then a rename).
   - Objects can be named by a short, unique prefix of their hash.
+  - `hash-object` refuses a malformed tree, commit or tag, as git does.
 - **Staging area**
   - `add` for files, folders and deleted files.
   - `status` in the long format and with `--short`, whose output is the same
@@ -23,6 +24,8 @@ changes.
   - `ls-files`, with `-s` for the mode, hash and stage of each entry.
   - The index uses Git's binary format, version 2, with its checksum, and is
     updated safely through a lock file (`.git/index.lock`).
+  - `status`, `add` and `commit -a` handle a tracked file that was replaced by
+    a folder, or a folder replaced by a file, the way git does.
 - **History**
   - `commit` (`-m`, `-F`, `-a`, `--allow-empty`), `write-tree`, `commit-tree`,
     `log` (`--oneline`, `-n <number>` or `-<number>`, and revisions to start
@@ -34,6 +37,16 @@ changes.
     `user.email` in git config.
   - Commits are byte-for-byte identical to git's: the same files, identity,
     date and message give the same commit hash.
+- **Robustness**
+  - Every file mgit reads, and standard input, has a size limit, and an
+    object's header is checked before memory is allocated for it. A corrupt
+    or hostile repository gives an error instead of using up the memory.
+  - Trees, folders and history are walked with loops that have fixed limits,
+    never with recursion, so deeply nested or looping data (such as symbolic
+    refs that point to each other) gives an error instead of a hang or a
+    crash.
+  - Usage errors exit with status 129, as in git, and an error while printing
+    the output (such as a full disk) is reported, with exit status 1.
 - **Engineering**
   - Continuous integration with GitHub Actions: tests on Linux and macOS with
     Go 1.26 and 1.27, a Windows cross-compile, and a `go mod tidy` check.
