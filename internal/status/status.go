@@ -9,11 +9,11 @@ package status
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path"
 	"sort"
 
+	"github.com/MITRAKER/mini-git/internal/history"
 	"github.com/MITRAKER/mini-git/internal/index"
 	"github.com/MITRAKER/mini-git/internal/object"
 	"github.com/MITRAKER/mini-git/internal/repo"
@@ -41,11 +41,6 @@ type Result struct {
 	Untracked []string // sorted; whole untracked folders end in "/"
 }
 
-type treeFile struct {
-	mode uint32
-	hash object.Hash
-}
-
 // Compute builds the status of a repository.
 func Compute(r *repo.Repo, ix *index.Index) (*Result, error) {
 	head, err := r.Head()
@@ -55,17 +50,13 @@ func Compute(r *repo.Repo, ix *index.Index) (*Result, error) {
 	res := &Result{Head: head}
 
 	// 1. Flatten the last commit's tree into path -> file.
-	committed := map[string]treeFile{}
+	committed := map[string]history.File{}
 	if head.HasCommit {
-		_, data, err := r.Objects.Read(head.Commit)
+		commit, err := history.ReadCommit(r.Objects, head.Commit)
 		if err != nil {
 			return nil, err
 		}
-		tree, err := object.CommitTree(data)
-		if err != nil {
-			return nil, err
-		}
-		if err := flattenTree(r.Objects, tree, "", committed); err != nil {
+		if committed, err = history.FlattenTree(r.Objects, commit.Tree); err != nil {
 			return nil, err
 		}
 	}
@@ -86,7 +77,7 @@ func Compute(r *repo.Repo, ix *index.Index) (*Result, error) {
 		switch {
 		case !ok:
 			get(e.Path).Staged = Added
-		case old.hash != e.Hash || old.mode != e.Mode:
+		case old.Hash != e.Hash || old.Mode != e.Mode:
 			get(e.Path).Staged = Modified
 		}
 	}
@@ -127,35 +118,6 @@ func Compute(r *repo.Repo, ix *index.Index) (*Result, error) {
 	// 4. Files on disk that are not in the index.
 	res.Untracked, err = findUntracked(r, ix)
 	return res, err
-}
-
-// flattenTree walks a tree and its subtrees, recording every file by its full
-// path, so it can be compared with the flat list in the index.
-func flattenTree(store *object.Store, h object.Hash, prefix string, out map[string]treeFile) error {
-	typ, data, err := store.Read(h)
-	if err != nil {
-		return err
-	}
-	if typ != object.Tree {
-		return fmt.Errorf("%s is a %s, not a tree", h, typ)
-	}
-	entries, err := object.ParseTree(data)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		p := path.Join(prefix, e.Name)
-		if e.Type() == object.Tree {
-			if err := flattenTree(store, e.Hash, p, out); err != nil {
-				return err
-			}
-			continue
-		}
-		var mode uint32
-		fmt.Sscanf(e.Mode, "%o", &mode)
-		out[p] = treeFile{mode: mode, hash: e.Hash}
-	}
-	return nil
 }
 
 // findUntracked lists files the index does not track. Like Git, a folder that

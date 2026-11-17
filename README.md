@@ -16,8 +16,8 @@ suite uses that to check every result against Git itself.
 |------|----------|-------|
 | 1. Object store | `init`, `hash-object`, `cat-file` | done |
 | 2. Index | `add`, `status`, `ls-files` | done |
-| 3. History | `commit`, `log` | next |
-| 4. Refs | `branch`, `checkout` | planned |
+| 3. History | `commit`, `log`, `rev-parse`, `write-tree`, `commit-tree` | done |
+| 4. Refs | `branch`, `checkout` | next |
 | 5. Diff | `diff` | planned |
 | 6. Stretch | `merge`, `.gitignore`, tags | planned |
 
@@ -31,18 +31,24 @@ mkdir demo && cd demo
 echo "hello world" > hello.txt
 ../mgit add hello.txt
 ../mgit status
-../mgit ls-files -s
-git status            # real Git understands the repository too
+../mgit commit -m "First commit"     # uses user.name and user.email from git config
+../mgit log
+../mgit rev-parse HEAD^{tree}
+git log               # real Git understands the repository too
 ```
 
 ## Layout
 
 ```
 cmd/mgit/          command-line entry point, one file per group of commands
-internal/object/   objects: hashing, zlib storage, trees
+internal/object/   objects: hashing, zlib storage, trees, commits
 internal/repo/     finding/creating repositories, HEAD and refs
 internal/index/    the staging area in Git's binary index format
 internal/status/   comparing HEAD, the index and the working tree
+internal/history/  index -> trees -> commits, identity, walking history
+internal/revision/ names like HEAD~2, main, v1.0^{} and HEAD:path
+internal/config/   reading .gitconfig files
+internal/lockfile/ safe file updates with <file>.lock
 e2e/               end-to-end tests that compare mgit with real git
 ```
 

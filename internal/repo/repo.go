@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/MITRAKER/mini-git/internal/lockfile"
 	"github.com/MITRAKER/mini-git/internal/object"
 )
 
@@ -133,35 +134,66 @@ type Head struct {
 // Head reads .git/HEAD. Normally it holds "ref: refs/heads/<branch>", and the
 // branch file holds a commit hash. A "detached" HEAD holds a hash directly.
 func (r *Repo) Head() (Head, error) {
-	raw, err := os.ReadFile(filepath.Join(r.GitDir, "HEAD"))
+	target, err := r.HeadTarget()
 	if err != nil {
 		return Head{}, err
 	}
-	content := strings.TrimSpace(string(raw))
-
-	ref, isRef := strings.CutPrefix(content, "ref: ")
-	if !isRef {
-		h, err := object.ParseHash(content)
-		return Head{Commit: h, HasCommit: err == nil}, err
+	h, ok, err := r.ResolveRef("HEAD")
+	if err != nil {
+		return Head{}, err
 	}
-	head := Head{Branch: strings.TrimPrefix(ref, "refs/heads/")}
-	h, ok, err := r.ResolveRef(ref)
-	head.Commit, head.HasCommit = h, ok
-	return head, err
+	head := Head{Commit: h, HasCommit: ok}
+	if target != "HEAD" {
+		head.Branch = strings.TrimPrefix(target, "refs/heads/")
+	}
+	return head, nil
 }
 
-// ResolveRef reads a reference such as "refs/heads/main". Git keeps each ref
-// in its own file, but may also pack many refs into .git/packed-refs.
-func (r *Repo) ResolveRef(ref string) (object.Hash, bool, error) {
-	raw, err := os.ReadFile(filepath.Join(r.GitDir, filepath.FromSlash(ref)))
-	if err == nil {
-		h, err := object.ParseHash(strings.TrimSpace(string(raw)))
-		return h, err == nil, err
+// HeadTarget returns the ref HEAD points to, such as "refs/heads/main". When
+// HEAD is detached (holds a commit hash itself) it returns "HEAD": the commit
+// command then moves HEAD directly instead of a branch.
+func (r *Repo) HeadTarget() (string, error) {
+	raw, err := os.ReadFile(filepath.Join(r.GitDir, "HEAD"))
+	if err != nil {
+		return "", err
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return object.Hash{}, false, err
+	if ref, ok := strings.CutPrefix(strings.TrimSpace(string(raw)), "ref: "); ok {
+		return ref, nil
 	}
+	return "HEAD", nil
+}
 
+// ResolveRef reads a reference such as "HEAD" or "refs/heads/main" and
+// returns the commit it points to. The bool is false when the ref does not
+// exist (for example, the branch of a new repository before its first commit).
+//
+// A ref file holds either a hash, or "ref: <other ref>" (a symbolic ref, like
+// HEAD), which is followed. Git may also keep many refs in one file,
+// .git/packed-refs, so that is checked when there is no separate file.
+func (r *Repo) ResolveRef(ref string) (object.Hash, bool, error) {
+	for depth := 0; depth < 5; depth++ {
+		raw, err := os.ReadFile(filepath.Join(r.GitDir, filepath.FromSlash(ref)))
+		if errors.Is(err, os.ErrNotExist) {
+			return r.packedRef(ref)
+		}
+		if err != nil {
+			return object.Hash{}, false, err
+		}
+		content := strings.TrimSpace(string(raw))
+		if next, ok := strings.CutPrefix(content, "ref: "); ok {
+			ref = next
+			continue
+		}
+		h, err := object.ParseHash(content)
+		if err != nil {
+			return h, false, fmt.Errorf("ref %s is corrupt: %w", ref, err)
+		}
+		return h, true, nil
+	}
+	return object.Hash{}, false, fmt.Errorf("ref %s: too many levels of symbolic refs", ref)
+}
+
+func (r *Repo) packedRef(ref string) (object.Hash, bool, error) {
 	f, err := os.Open(filepath.Join(r.GitDir, "packed-refs"))
 	if errors.Is(err, os.ErrNotExist) {
 		return object.Hash{}, false, nil
@@ -179,6 +211,37 @@ func (r *Repo) ResolveRef(ref string) (object.Hash, bool, error) {
 		}
 	}
 	return object.Hash{}, false, sc.Err()
+}
+
+// RefExists reports whether a ref exists, as a file or in packed-refs.
+func (r *Repo) RefExists(ref string) (bool, error) {
+	_, ok, err := r.ResolveRef(ref)
+	return ok, err
+}
+
+// UpdateRef points ref at newHash. It is a "compare-and-swap": it only
+// succeeds if the ref still holds oldHash (or, when oldExists is false, does
+// not exist yet). Holding the ref's lock file while checking and writing makes
+// that safe even when two commands run at the same time.
+func (r *Repo) UpdateRef(ref string, newHash, oldHash object.Hash, oldExists bool) error {
+	path := filepath.Join(r.GitDir, filepath.FromSlash(ref))
+	lock, err := lockfile.Acquire(path)
+	if err != nil {
+		return err
+	}
+	defer lock.Rollback() // does nothing once Commit has succeeded
+
+	cur, exists, err := r.ResolveRef(ref)
+	if err != nil {
+		return err
+	}
+	if exists != oldExists || cur != oldHash {
+		return fmt.Errorf("cannot update %s: it changed while this command was running", ref)
+	}
+	if err := lock.Write([]byte(newHash.String() + "\n")); err != nil {
+		return err
+	}
+	return lock.Commit()
 }
 
 // ReadWorktreeFile returns the bytes Git would store for a file: its contents,

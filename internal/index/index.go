@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MITRAKER/mini-git/internal/lockfile"
 	"github.com/MITRAKER/mini-git/internal/object"
 )
 
@@ -165,25 +166,19 @@ func Parse(data []byte) (*Index, error) {
 // least one NUL, which also terminates the path.
 func paddedLen(n int) int { return (n + 8) &^ 7 }
 
-// Write saves the index to path. It writes "index.lock" first and renames it
-// over the real file, so readers never see a half-written index, and two
-// commands running at once cannot both write it.
+// Write saves the index to path through a lock file (see package lockfile),
+// so readers never see a half-written index and two commands running at once
+// cannot both write it.
 func (ix *Index) Write(path string) error {
-	lock := path + ".lock"
-	f, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("%s exists: another mgit or git command may be running", lock)
-	}
+	lock, err := lockfile.Acquire(path)
 	if err != nil {
 		return err
 	}
-	_, werr := f.Write(ix.Encode())
-	cerr := f.Close()
-	if werr != nil || cerr != nil {
-		os.Remove(lock)
-		return errors.Join(werr, cerr)
+	defer lock.Rollback() // does nothing once Commit has succeeded
+	if err := lock.Write(ix.Encode()); err != nil {
+		return err
 	}
-	return os.Rename(lock, path)
+	return lock.Commit()
 }
 
 // Encode returns the bytes of the index file.

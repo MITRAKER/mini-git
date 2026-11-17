@@ -1,88 +1,13 @@
-// Package e2e runs the mgit binary and checks every result against the real
-// git, so we know mgit reads and writes exactly what Git does.
 package e2e
 
+// Tests for steps 1 and 2: objects, the index and status.
+
 import (
-	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-var mgitBin string
-
-func TestMain(m *testing.M) {
-	if _, err := exec.LookPath("git"); err != nil {
-		println("skipping end-to-end tests: git is not installed")
-		os.Exit(0)
-	}
-	dir, err := os.MkdirTemp("", "mgit-e2e")
-	if err != nil {
-		panic(err)
-	}
-	mgitBin = filepath.Join(dir, "mgit")
-	build := exec.Command("go", "build", "-o", mgitBin, "../cmd/mgit")
-	build.Stdout, build.Stderr = os.Stdout, os.Stderr
-	if err := build.Run(); err != nil {
-		panic("building mgit: " + err.Error())
-	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
-}
-
-// run executes a program in dir and returns its standard output.
-func run(t *testing.T, dir, stdin, prog string, args ...string) string {
-	t.Helper()
-	cmd := exec.Command(prog, args...)
-	cmd.Dir = dir
-	cmd.Stdin = strings.NewReader(stdin)
-	// Keep the user's own git settings out of the tests.
-	cmd.Env = append(os.Environ(),
-		"HOME="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
-		"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com",
-		"GIT_AUTHOR_DATE=2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2026-01-01T00:00:00Z",
-	)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("%s %s: %v\n%s", filepath.Base(prog), strings.Join(args, " "), err, stderr.String())
-	}
-	return string(out)
-}
-
-func mgit(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	return run(t, dir, "", mgitBin, args...)
-}
-
-func git(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	return run(t, dir, "", "git", args...)
-}
-
-func writeFile(t *testing.T, dir, name, content string, perm os.FileMode) {
-	t.Helper()
-	p := filepath.Join(dir, filepath.FromSlash(name))
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte(content), perm); err != nil {
-		t.Fatal(err)
-	}
-	os.Chmod(p, perm) // WriteFile keeps the old mode of an existing file
-}
-
-func newRepo(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	mgit(t, dir, "init")
-	return dir
-}
 
 func TestInitCreatesARepoGitUnderstands(t *testing.T) {
 	dir := newRepo(t)

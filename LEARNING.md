@@ -18,6 +18,7 @@ Contents
 - [Lesson 0: The big picture](#lesson-0-the-big-picture)
 - [Lesson 1: The object store (`init`, `hash-object`, `cat-file`)](#lesson-1-the-object-store)
 - [Lesson 2: The index and `status` (`add`, `status`, `ls-files`)](#lesson-2-the-index-and-status)
+- [Lesson 3: Commits and history (`commit`, `log`, `rev-parse`)](#lesson-3-commits-and-history)
 - [How the code is tested](#how-the-code-is-tested)
 
 ---
@@ -370,6 +371,231 @@ xxd .git/index | head           # see "DIRC", the version and entry count
 
 ---
 
+## Lesson 3: Commits and history
+
+**Commands:** `mgit commit`, `mgit log`, `mgit rev-parse`, and the plumbing
+commands `mgit write-tree` and `mgit commit-tree`
+**Code:** [`internal/history/`](internal/history), [`internal/object/commit.go`](internal/object/commit.go), [`internal/revision/`](internal/revision), [`internal/config/`](internal/config), [`internal/lockfile/`](internal/lockfile), [`cmd/mgit/history.go`](cmd/mgit/history.go)
+
+A commit is three steps, and Git has a "plumbing" command for each one.
+mgit has them too, so you can run the steps by hand:
+
+```
+mgit commit -m "msg"   =   1. mgit write-tree          index   -> tree objects
+                           2. mgit commit-tree <tree>  tree    -> commit object
+                           3. move the branch          branch  -> new commit
+```
+
+### 3.1 From the index to trees (`write-tree`)
+
+The index is flat: `README.md`, `src/main.go`, `src/util/x.go`. A tree object
+lists only **one folder**. So `history.WriteTree` makes one tree per folder,
+starting from the deepest ones, and each parent lists its subfolders by name
+with mode `40000` and the subfolder's tree hash:
+
+```
+root tree                         tree for src/
+  100644 blob 3b18e5  README.md     100644 blob 9f2c1a  main.go
+  40000  tree 7d0e4b  src    ──▶    40000  tree e1a9c3  util   ──▶ ...
+```
+
+Because the index is **sorted**, all paths inside `src/` sit next to each
+other. `writeTree` finds where that run of entries ends and calls itself on
+just that slice. That is a *recursive* function: it solves "write the tree for
+`src/`" by solving the same problem for each subfolder.
+
+**The sort-order trap.** Git sorts tree entries by name, but compares a folder
+as if its name ended in `/`. So for a file `a-b`, a file `a.c` and a folder `a`:
+
+```
+plain string order:  a   a-b  a.c     ("a" is shortest, so first)
+Git tree order:      a-b  a.c  a/     ('-' is 0x2D, '.' is 0x2E, '/' is 0x2F)
+```
+
+`object.EncodeTree` sorts with that rule. Getting it wrong would not crash
+anything, it would just produce a different hash than Git, which is exactly
+the kind of bug the "identical hashes" test (below) catches.
+
+**Why a tree per folder?** If you change one file deep inside `src/util/`,
+only the trees on the path to it change: `util`, `src` and the root. Every
+other folder's tree keeps its hash and is shared with the previous commit. A
+new commit costs a few small objects, not a copy of the project.
+
+### 3.2 The commit object
+
+```
+tree 8aa71000c74aa9525a52199df9caf73dfd9f0275
+parent 2a5cb45bd0ae5169dcf9dbfab9c3bac49fdd94c6
+author Mitra <mitra@example.com> 1767205800 +0530
+committer Mitra <mitra@example.com> 1767205800 +0530
+
+Fix the login bug
+```
+
+- `tree` is the snapshot: the root tree from step 1.
+- `parent` is the commit you were on. The first commit has none; a merge has
+  two. Parents are what turn separate snapshots into a **history**.
+- `author` wrote the change; `committer` saved it as a commit. They differ
+  when, for example, a maintainer applies your patch.
+- The time is **seconds since 1970-01-01 UTC**, plus the person's **time
+  zone offset** (`+0530`, `-0500`). Storing UTC seconds makes times comparable
+  everywhere; storing the offset lets `log` show the time the person saw on
+  their clock. See `object.Signature`, `FormatZone` and `ParseZone`.
+- After a blank line comes the message.
+
+**Same inputs, same hash.** A commit is just bytes, so the same tree, parents,
+people, times and message always give the same hash, in Git or in mgit. That
+means every byte must match Git, including how the message is tidied:
+`git commit -m` strips trailing spaces, removes blank lines at the start and
+end, and squeezes several blank lines into one (`history.CleanupMessage`).
+Several `-m` options become separate paragraphs (`history.JoinParagraphs`).
+
+### 3.3 Who are you? Reading Git's config
+
+The author's name and email come from the first of these that is set
+(`history.Identity`):
+
+1. environment variables: `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`
+   (and `GIT_COMMITTER_*`)
+2. config keys `author.name` / `committer.name`, then `user.name` (same for email)
+
+Config files are read in order: system (`/etc/gitconfig`), global
+(`~/.config/git/config` and `~/.gitconfig`), then the repository's
+`.git/config`. A later file overrides an earlier one, so a repository can use
+a different email than your global one. `internal/config` parses the format:
+
+```ini
+[user]
+	name = "Mitra K"        # quotes keep spaces, '#' or ';' starts a comment
+[branch "Feature"]          # subsection: keeps its case
+	remote = origin         # key: branch.Feature.remote
+```
+
+Section and key names ignore case (`USER.NAME` = `user.name`), subsection
+names do not. Because mgit reads the same files, `git config user.name ...`
+configures both.
+
+### 3.4 Moving the branch: refs and HEAD
+
+After the commit object exists, nothing points to it yet. Step 3 updates the
+branch file, for example `.git/refs/heads/main`, to hold the new hash.
+`HEAD` tells us which branch that is:
+
+```
+.git/HEAD              ref: refs/heads/main     (a "symbolic ref")
+.git/refs/heads/main   232d946fe114e31c107ba111b0334c6e5c353a62
+```
+
+If `HEAD` holds a hash instead of `ref: ...`, you are on a **detached HEAD**
+(not on any branch), and committing moves `HEAD` itself
+(`repo.HeadTarget`). `repo.ResolveRef` follows symbolic refs and also checks
+`.git/packed-refs`, where Git may store many refs in one file.
+
+**Compare-and-swap.** `repo.UpdateRef(ref, new, old)` only moves the branch
+if it still points at `old`, the parent we used. It holds the lock
+`refs/heads/main.lock` (the same lock-file pattern as the index, now shared
+in `internal/lockfile`) while it checks and writes. If two commits raced, the
+second one fails instead of silently throwing the first one away.
+
+### 3.5 Walking history (`log`)
+
+Commits point to their parents, never to their children. History is a
+**directed acyclic graph** (DAG): you can only walk backwards, and merges make
+paths split and join again:
+
+```
+  A ← B ← D ← E ← M ← F      M is a merge: parents E and C
+       ↖           ↙
+         C ←───────
+```
+
+`history.Walk` starts from HEAD and repeatedly shows the **newest** commit it
+knows about, then adds that commit's parents to the queue. "Newest" means the
+latest committer date, so the queue is a **priority queue**
+(`container/heap`). A `seen` set makes sure a commit reachable along two
+paths (like `B` above) is shown only once. This gives the same order as
+`git log`, which the tests check on a history with a merge.
+
+`--oneline` shows each hash's **shortest unique prefix** of at least 7
+characters (`Store.Abbrev`): it looks at the other objects that start with
+the same two characters and makes the prefix one character longer than the
+longest shared prefix.
+
+### 3.6 Naming commits (`rev-parse`)
+
+`internal/revision` turns names into hashes. Every command that takes a
+commit uses it, including `log` and `cat-file`:
+
+| You type | Means |
+|----------|-------|
+| `HEAD`, `@` | the current commit |
+| `main`, `v1.0` | a branch or tag (tried in order: `refs/<name>`, `refs/tags/<name>`, `refs/heads/<name>`, `refs/remotes/<name>`) |
+| `2a5cb45` | a unique hash prefix |
+| `HEAD~2` | two steps back along **first** parents (the grandparent) |
+| `HEAD^2` | the **second parent** of a merge |
+| `HEAD^{tree}` | the commit's tree |
+| `v1.0^{}` | follow an annotated tag to what it tags |
+| `HEAD:src/main.go` | the file at that path in that commit |
+| `:src/main.go` | the file at that path in the index |
+
+`~` and `^` are easy to mix up: `~n` walks back n generations, always
+taking the first parent; `^n` picks the n-th parent of one commit. They only
+differ at merges.
+
+An **annotated tag** (`git tag -a`) is its own object type, `tag`, which
+points at a commit and adds a tagger and message. A **lightweight tag** is
+just a ref file holding a commit hash. "Peeling" (`revision.Peel`) follows
+tags (and commit → tree) until it reaches the type you asked for.
+
+### Try it
+
+```sh
+mkdir history-demo && cd history-demo && mgit init
+git config user.name "Your Name" && git config user.email "you@example.com"
+
+echo one > a.txt && mgit add a.txt && mgit commit -m "First commit"
+echo two >> a.txt && mgit commit -a -m "Second commit"
+mgit log
+mgit log --oneline
+git log --oneline              # real Git reads mgit's history
+
+# The three steps by hand:
+echo three > b.txt && mgit add b.txt
+tree=$(mgit write-tree)
+mgit cat-file -p $tree
+commit=$(mgit commit-tree -p HEAD -m "By hand" $tree)
+mgit cat-file -p $commit
+cat .git/refs/heads/main       # still the old commit: nothing moved yet
+
+# Naming things
+mgit rev-parse HEAD HEAD~1 HEAD^{tree} HEAD:a.txt
+mgit cat-file -p HEAD~1:a.txt
+
+# Same inputs, same hash, in Git and mgit
+export GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z"
+git commit-tree -m "same" $tree
+mgit commit-tree -m "same" $tree   # the same hash
+```
+
+### Exercises
+
+1. Run the last two commands again a minute later. Why is the hash still the
+   same? Now `unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE` and try twice more.
+2. After `commit-tree` above, the branch did not move. Use
+   `git update-ref refs/heads/main <hash>` to finish step 3 by hand, then run
+   `mgit log`.
+3. Change one file in a deep folder and commit. Use `cat-file -p` to find which
+   tree objects changed and which ones were reused from the previous commit.
+4. Make a branch and a merge with `git`, then compare `mgit log --oneline` and
+   `git log --oneline`. Draw the DAG on paper and explain the order.
+5. Create `.git/refs/heads/main.lock` and try to commit. Which function
+   refuses, and what would go wrong without the lock?
+6. Harder: add `--amend`. It is a commit whose parents are the *current
+   commit's* parents instead of the current commit.
+
+
+---
+
 ## How the code is tested
 
 There are two layers of tests (`go test ./...`):
@@ -382,6 +608,9 @@ There are two layers of tests (`go test ./...`):
   on the same repository. For example, `TestStatusMatchesGit` creates edits,
   deletions, permission changes and untracked folders, then checks that
   `mgit status --short` prints exactly what `git status --porcelain` prints.
+  `TestCommitsAreByteForByteIdenticalToGit` goes furthest: it makes the same
+  commits with Git and with mgit and requires **identical commit hashes**,
+  which proves every byte of every blob, tree and commit matches.
 
 Using an existing, trusted program as the answer key is called *differential
 testing* (or using a "test oracle"). It is how you test a re-implementation:
@@ -391,5 +620,5 @@ with Git. GitHub Actions runs all of it on Linux and macOS for every push
 
 ---
 
-*Next lesson: `commit` and `log`, which turn the index into tree objects and
-link commits into a history.*
+*Next: making the repository professional (CI/CD, linters, security
+scanning and NASA/JPL coding rules), then `branch` and `checkout`.*
