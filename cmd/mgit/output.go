@@ -11,9 +11,11 @@ import (
 )
 
 // output buffers what a command prints. Printing can fail too (a full disk,
-// a closed pipe), so output remembers the first error and flush returns it:
-// a command's output is checked once, at the end, instead of after every
-// line (coding standard, rule 7). Try `mgit log > /dev/full`.
+// an I/O error), so output remembers the first error and flush returns it: a
+// command's output is checked once, at the end, instead of after every line
+// (coding standard, rule 7). Try `mgit log > /dev/full`. (A closed pipe, as
+// in `mgit log | head -1`, is different: like git, mgit is then stopped by
+// the SIGPIPE signal, without a message.)
 type output struct {
 	w   *bufio.Writer
 	err error

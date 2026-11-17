@@ -85,16 +85,24 @@ func ParseHash(s string) (Hash, error) {
 	return h, nil
 }
 
-// encode builds the uncompressed object: a header, a NUL byte, then the data.
-func encode(t Type, data []byte) []byte {
-	header := fmt.Sprintf("%s %d\x00", t, len(data))
-	return append([]byte(header), data...)
+// header returns the start of an uncompressed object: the type, a space,
+// the size in decimal and a NUL byte. The data follows it.
+func header(t Type, size int) string {
+	return fmt.Sprintf("%s %d\x00", t, size)
 }
 
 // Compute returns the hash an object of type t with this data would have.
-// It does not write anything.
+// It does not write anything. SHA-1 reads the header and then the data, which
+// gives the same hash as reading them joined together, without copying the
+// data (which can be up to MaxSize bytes).
 func Compute(t Type, data []byte) Hash {
-	return sha1.Sum(encode(t, data)) //nolint:gosec // G401: SHA-1 is Git's object name, not a security control
+	d := sha1.New() //nolint:gosec // G401: SHA-1 is Git's object name, not a security control
+	// Writing to a hash.Hash never returns an error.
+	_, _ = io.WriteString(d, header(t, len(data)))
+	_, _ = d.Write(data)
+	var h Hash
+	copy(h[:], d.Sum(nil))
+	return h
 }
 
 // ErrNotFound is returned when no object matches a name.
@@ -130,18 +138,18 @@ func (s *Store) Write(t Type, data []byte) (Hash, error) {
 	if len(data) > MaxSize {
 		return Hash{}, fmt.Errorf("object of %d bytes is larger than the %d byte limit", len(data), MaxSize)
 	}
-	raw := encode(t, data)
-	h := Hash(sha1.Sum(raw)) //nolint:gosec // G401: SHA-1 is Git's object name, not a security control
+	h := Compute(t, data)
 	if s.Has(h) {
 		return h, nil
 	}
 
+	// The header and the data are compressed one after the other, so the
+	// data is not copied.
 	var buf bytes.Buffer
 	zw := zlib.NewWriter(&buf)
-	if _, err := zw.Write(raw); err != nil {
-		return h, err
-	}
-	if err := zw.Close(); err != nil {
+	_, headerErr := io.WriteString(zw, header(t, len(data)))
+	_, dataErr := zw.Write(data)
+	if err := errors.Join(headerErr, dataErr, zw.Close()); err != nil {
 		return h, err
 	}
 	return h, writeAtomically(s.path(h), buf.Bytes())

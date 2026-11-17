@@ -108,15 +108,23 @@ An object is stored like this:
 In Go (`internal/object/object.go`):
 
 ```go
-func encode(t Type, data []byte) []byte {
-	header := fmt.Sprintf("%s %d\x00", t, len(data))
-	return append([]byte(header), data...)
+func header(t Type, size int) string {
+	return fmt.Sprintf("%s %d\x00", t, size)
 }
 
 func Compute(t Type, data []byte) Hash {
-	return sha1.Sum(encode(t, data))
+	d := sha1.New()
+	io.WriteString(d, header(t, len(data))) // first the header...
+	d.Write(data)                           // ...then the content
+	var h Hash
+	copy(h[:], d.Sum(nil))
+	return h
 }
 ```
+
+SHA-1 can read its input in pieces: hashing the header and then the content
+gives exactly the hash of the two joined together. So mgit never copies the
+content, which can be large, just to put a header in front of it.
 
 **Why include the header in the hash?** So that a blob and a tree with the same
 bytes get different names, and so the size can be checked when reading.

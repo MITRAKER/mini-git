@@ -97,8 +97,9 @@ type cmdResult struct {
 	err            error
 }
 
-// exec runs prog in dir. env adds to or overrides baseEnv; an empty value
-// removes the variable.
+// execIn runs prog in dir and returns its output and error, without failing
+// the test. env adds to or overrides baseEnv; an empty value removes the
+// variable.
 func execIn(dir string, env map[string]string, stdin, prog string, args ...string) cmdResult {
 	cmd := exec.Command(prog, args...)
 	cmd.Dir = dir
