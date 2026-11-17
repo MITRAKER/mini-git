@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-
 	"github.com/MITRAKER/mini-git/internal/object"
 	"github.com/MITRAKER/mini-git/internal/revision"
 )
@@ -53,7 +51,7 @@ type hasher struct {
 }
 
 func (h *hasher) hashStdin() error {
-	data, err := readLimited(os.Stdin, "standard input")
+	data, err := readStdin()
 	if err != nil {
 		return err
 	}
@@ -61,7 +59,7 @@ func (h *hasher) hashStdin() error {
 }
 
 func (h *hasher) hashFile(name string) error {
-	data, err := readFileLimited(name)
+	data, err := readFile(name)
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/MITRAKER/mini-git/internal/bounded"
 	"github.com/MITRAKER/mini-git/internal/object"
 )
 
@@ -209,5 +210,5 @@ func ReadWorktreeFile(path string, fi os.FileInfo) ([]byte, error) {
 	if fi.Size() > object.MaxSize {
 		return nil, fmt.Errorf("%s is %d bytes, larger than mgit's %d byte limit", path, fi.Size(), object.MaxSize)
 	}
-	return os.ReadFile(path)
+	return bounded.ReadFile(path, object.MaxSize) // the file may grow after Lstat
 }

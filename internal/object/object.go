@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/MITRAKER/mini-git/internal/bounded"
 )
 
 // Type is the kind of an object.
@@ -51,6 +53,9 @@ const (
 	// before allocating means a tiny hostile file cannot make mgit allocate
 	// a gigabyte.
 	maxDeflateRatio = 1032
+	// maxCompressedSize is the largest object file mgit reads: zlib can make
+	// data that does not compress a little larger, by a few bytes per 64 KiB.
+	maxCompressedSize = MaxSize + 1<<20
 )
 
 // ParseType checks that s names a known object type.
@@ -173,7 +178,7 @@ func writeAtomically(dest string, data []byte) error {
 // are: the header is well formed, the size is within MaxSize and matches the
 // data, and the SHA-1 of the bytes is really h (so a corrupted file is caught).
 func (s *Store) Read(h Hash) (Type, []byte, error) {
-	compressed, err := os.ReadFile(s.path(h))
+	compressed, err := bounded.ReadFile(s.path(h), maxCompressedSize)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil, fmt.Errorf("%s: %w", h, ErrNotFound)
 	}

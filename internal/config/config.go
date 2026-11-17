@@ -19,10 +19,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/MITRAKER/mini-git/internal/bounded"
 )
 
 // maxFileSize bounds how much of one config file mgit reads (coding
@@ -44,7 +45,7 @@ func newConfig() *Config { return &Config{values: map[string][]string{}} }
 func Load(gitDir string) (*Config, error) {
 	c := newConfig()
 	for _, f := range files(gitDir) {
-		data, err := readFile(f)
+		data, err := bounded.ReadFile(f, maxFileSize)
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
 			continue
 		}
@@ -95,22 +96,6 @@ func globalFiles() []string {
 		list = append(list, filepath.Join(home, ".gitconfig"))
 	}
 	return list
-}
-
-// readFile reads a file of at most maxFileSize bytes.
-func readFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(f, maxFileSize+1))
-	if err := errors.Join(readErr, f.Close()); err != nil {
-		return nil, err
-	}
-	if len(data) > maxFileSize {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxFileSize)
-	}
-	return data, nil
 }
 
 // Parse reads the text of one config file.

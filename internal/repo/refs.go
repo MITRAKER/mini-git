@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/MITRAKER/mini-git/internal/bounded"
 	"github.com/MITRAKER/mini-git/internal/lockfile"
 	"github.com/MITRAKER/mini-git/internal/object"
 )
@@ -15,6 +16,10 @@ import (
 // maxSymrefDepth is how many "ref: ..." links ResolveRef follows, the same
 // limit Git uses. It stops a loop of symbolic refs.
 const maxSymrefDepth = 5
+
+// maxRefFileSize bounds how much of HEAD or a loose ref file is read. A ref
+// file holds one hash or one "ref: <name>" line.
+const maxRefFileSize = 64 << 10
 
 // Head describes what HEAD points at.
 type Head struct {
@@ -45,7 +50,7 @@ func (r *Repo) Head() (Head, error) {
 // HEAD is detached (holds a commit hash itself) it returns "HEAD": the commit
 // command then moves HEAD directly instead of a branch.
 func (r *Repo) HeadTarget() (string, error) {
-	raw, err := os.ReadFile(filepath.Join(r.GitDir, "HEAD"))
+	raw, err := bounded.ReadFile(filepath.Join(r.GitDir, "HEAD"), maxRefFileSize)
 	if err != nil {
 		return "", err
 	}
@@ -106,7 +111,7 @@ func (r *Repo) readRefFile(ref string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	raw, err := os.ReadFile(p)
+	raw, err := bounded.ReadFile(p, maxRefFileSize)
 	if err != nil {
 		return "", false, err
 	}
@@ -117,7 +122,7 @@ func (r *Repo) readRefFile(ref string) (string, bool, error) {
 // "<hash> <refname>". Lines starting with '#' are comments and lines starting
 // with '^' give the commit an annotated tag points to.
 func (r *Repo) packedRef(ref string) (object.Hash, bool, error) {
-	data, err := os.ReadFile(filepath.Join(r.GitDir, "packed-refs"))
+	data, err := bounded.ReadFile(filepath.Join(r.GitDir, "packed-refs"), object.MaxSize)
 	if errors.Is(err, os.ErrNotExist) {
 		return object.Hash{}, false, nil
 	}

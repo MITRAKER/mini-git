@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MITRAKER/mini-git/internal/bounded"
 	"github.com/MITRAKER/mini-git/internal/lockfile"
 	"github.com/MITRAKER/mini-git/internal/object"
 )
@@ -115,7 +116,7 @@ const (
 // Read loads the index at path. A missing file is an empty index, which is
 // what a brand new repository has.
 func Read(path string) (*Index, error) {
-	data, err := os.ReadFile(path)
+	data, err := bounded.ReadFile(path, object.MaxSize)
 	if errors.Is(err, os.ErrNotExist) {
 		return &Index{}, nil
 	}

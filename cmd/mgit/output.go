@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/MITRAKER/mini-git/internal/bounded"
 	"github.com/MITRAKER/mini-git/internal/object"
 )
 
@@ -43,28 +43,13 @@ func (o *output) flush() error {
 	return o.w.Flush()
 }
 
-// readLimited reads all of r, up to mgit's object size limit (coding
-// standard, rule 3). name says what r is, for the error message.
-func readLimited(r io.Reader, name string) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, object.MaxSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > object.MaxSize {
-		return nil, fmt.Errorf("%s is larger than mgit's %d byte limit", name, object.MaxSize)
-	}
-	return data, nil
+// readStdin reads all of standard input, up to mgit's object size limit
+// (coding standard, rule 3).
+func readStdin() ([]byte, error) {
+	return bounded.ReadAll(os.Stdin, object.MaxSize, "standard input")
 }
 
-// readFileLimited reads a whole file, up to mgit's object size limit.
-func readFileLimited(path string) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	data, readErr := readLimited(f, path)
-	if err := errors.Join(readErr, f.Close()); err != nil {
-		return nil, err
-	}
-	return data, nil
+// readFile reads a whole file, up to mgit's object size limit.
+func readFile(path string) ([]byte, error) {
+	return bounded.ReadFile(path, object.MaxSize)
 }

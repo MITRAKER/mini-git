@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
@@ -67,10 +66,10 @@ func commitMessage(messages []string, file string) (string, error) {
 	case len(messages) > 0:
 		return history.JoinParagraphs(messages), nil
 	case file == "-":
-		data, err := readLimited(os.Stdin, "standard input")
+		data, err := readStdin()
 		return string(data), err
 	case file != "":
-		data, err := readFileLimited(file)
+		data, err := readFile(file)
 		return string(data), err
 	}
 	return "", errors.New(`give a commit message with -m "message" (mgit has no editor)`)
@@ -350,7 +349,7 @@ func commitTreeMessage(messages []string) (string, error) {
 	if len(messages) > 0 {
 		return history.JoinParagraphs(messages), nil
 	}
-	data, err := readLimited(os.Stdin, "standard input")
+	data, err := readStdin()
 	return string(data), err
 }
 
