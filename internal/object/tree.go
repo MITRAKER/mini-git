@@ -3,6 +3,7 @@ package object
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -65,13 +66,29 @@ func FormatTree(entries []TreeEntry) string {
 	return b.String()
 }
 
-// CommitTree returns the tree hash a commit object points at. The first line
-// of every commit is "tree <hash>".
-func CommitTree(data []byte) (Hash, error) {
-	line, _, _ := bytes.Cut(data, []byte("\n"))
-	hx, ok := bytes.CutPrefix(line, []byte("tree "))
-	if !ok {
-		return Hash{}, fmt.Errorf("corrupt commit: first line is not a tree")
+// EncodeTree builds the binary body of a tree object from its entries.
+//
+// Git requires a specific order: entries sorted by name, except that a
+// subdirectory sorts as if its name ended in "/". So the file "a-b" comes
+// before the directory "a" (because '-' < '/'), even though "a" < "a-b" in
+// plain string order. Getting this wrong changes the tree's hash.
+func EncodeTree(entries []TreeEntry) []byte {
+	sorted := append([]TreeEntry(nil), entries...)
+	sortKey := func(e TreeEntry) string {
+		if e.Type() == Tree {
+			return e.Name + "/"
+		}
+		return e.Name
 	}
-	return ParseHash(string(hx))
+	sort.Slice(sorted, func(i, j int) bool { return sortKey(sorted[i]) < sortKey(sorted[j]) })
+
+	var buf bytes.Buffer
+	for _, e := range sorted {
+		buf.WriteString(e.Mode)
+		buf.WriteByte(' ')
+		buf.WriteString(e.Name)
+		buf.WriteByte(0)
+		buf.Write(e.Hash[:]) // 20 raw bytes, not 40 hex characters
+	}
+	return buf.Bytes()
 }

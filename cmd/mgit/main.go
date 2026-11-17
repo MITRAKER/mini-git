@@ -21,6 +21,11 @@ var commands = map[string]command{
 	"add":         {"stage files for the next commit", runAdd},
 	"status":      {"show staged, unstaged and untracked changes", runStatus},
 	"ls-files":    {"list the files in the index", runLsFiles},
+	"commit":      {"save the staged files as a new commit", runCommit},
+	"log":         {"show the commit history", runLog},
+	"rev-parse":   {"turn a name like HEAD~1 or main into a hash", runRevParse},
+	"write-tree":  {"store the index as tree objects (plumbing)", runWriteTree},
+	"commit-tree": {"create a commit object from a tree (plumbing)", runCommitTree},
 }
 
 // exitError ends the program with a status code but prints nothing,

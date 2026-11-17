@@ -9,6 +9,7 @@ import (
 
 	"github.com/MITRAKER/mini-git/internal/object"
 	"github.com/MITRAKER/mini-git/internal/repo"
+	"github.com/MITRAKER/mini-git/internal/revision"
 )
 
 func findRepo() (*repo.Repo, error) { return repo.Find(".") }
@@ -71,6 +72,8 @@ func runHashObject(args []string) error {
 }
 
 // mgit cat-file (-t | -s | -p | -e) <object>
+//
+// <object> can be any revision name: a hash, HEAD, main, HEAD~1:README.md ...
 func runCatFile(args []string) error {
 	fs := flag.NewFlagSet("cat-file", flag.ContinueOnError)
 	showType := fs.Bool("t", false, "print the object's type")
@@ -88,7 +91,7 @@ func runCatFile(args []string) error {
 		return err
 	}
 
-	h, err := r.Objects.Resolve(fs.Arg(0))
+	h, err := revision.Resolve(r, fs.Arg(0))
 	if *exists {
 		if err != nil {
 			return exitError(1)

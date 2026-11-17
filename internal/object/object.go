@@ -225,3 +225,29 @@ func (s *Store) Resolve(name string) (Hash, error) {
 		return Hash{}, fmt.Errorf("short object name %s is ambiguous (%d matches)", name, len(matches))
 	}
 }
+
+// Abbrev returns the shortest prefix of h, at least min characters long, that
+// no other object in the store shares. This is how `git log --oneline` picks
+// how many characters of each hash to show.
+func (s *Store) Abbrev(h Hash, min int) string {
+	hx := h.String()
+	n := min
+	entries, _ := os.ReadDir(filepath.Join(s.dir, hx[:2]))
+	for _, e := range entries {
+		other := hx[:2] + e.Name()
+		if other == hx || len(other) != 40 {
+			continue
+		}
+		common := 0
+		for common < 40 && other[common] == hx[common] {
+			common++
+		}
+		if common+1 > n {
+			n = common + 1
+		}
+	}
+	if n > 40 {
+		n = 40
+	}
+	return hx[:n]
+}
