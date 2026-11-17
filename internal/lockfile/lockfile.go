@@ -27,12 +27,12 @@ type Lock struct {
 // Acquire creates "<path>.lock" and returns the held lock. It fails if another
 // program holds the lock.
 func Acquire(path string) (*Lock, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // G301: same permissions as git
 		return nil, err
 	}
 	lockPath := path + ".lock"
 	// O_EXCL is the important flag: "fail if the file already exists".
-	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // G302: git's files are world-readable too
 	if errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("unable to create '%s': file exists; another mgit or git "+
 			"process may be running (if not, delete the .lock file)", lockPath)
@@ -57,24 +57,20 @@ func (l *Lock) Commit() error {
 	}
 	l.done = true
 	if err := l.file.Close(); err != nil {
-		os.Remove(l.file.Name())
-		return err
+		return errors.Join(err, os.Remove(l.file.Name()))
 	}
 	if err := os.Rename(l.file.Name(), l.target); err != nil {
-		os.Remove(l.file.Name())
-		return err
+		return errors.Join(err, os.Remove(l.file.Name()))
 	}
 	return nil
 }
 
-// Rollback throws the new contents away and releases the lock. It is safe to
-// call after Commit (it does nothing), so `defer lock.Rollback()` is a good
-// habit right after Acquire.
-func (l *Lock) Rollback() {
+// Rollback throws the new contents away and releases the lock, leaving the
+// target file untouched. After Commit it does nothing.
+func (l *Lock) Rollback() error {
 	if l.done {
-		return
+		return nil
 	}
 	l.done = true
-	l.file.Close()
-	os.Remove(l.file.Name())
+	return errors.Join(l.file.Close(), os.Remove(l.file.Name()))
 }

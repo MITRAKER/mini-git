@@ -2,6 +2,7 @@ package object
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -42,7 +43,7 @@ func ParseZone(s string) (*time.Location, error) {
 	}
 	hh, err1 := strconv.Atoi(s[1:3])
 	mm, err2 := strconv.Atoi(s[3:5])
-	if err1 != nil || err2 != nil {
+	if err1 != nil || err2 != nil || mm >= 60 {
 		return nil, fmt.Errorf("invalid time zone %q", s)
 	}
 	offset := hh*3600 + mm*60
@@ -84,6 +85,18 @@ type CommitData struct {
 	Message   string
 }
 
+// Check reports whether a signature can be stored: Git's "Name <email>"
+// format breaks if the name or email contains '<', '>' or a newline.
+func (s Signature) Check() error {
+	if s.Name == "" || s.Email == "" {
+		return errors.New("signature needs a name and an email")
+	}
+	if strings.ContainsAny(s.Name, "<>\n") || strings.ContainsAny(s.Email, "<>\n") {
+		return fmt.Errorf("name %q or email %q contains '<', '>' or a newline", s.Name, s.Email)
+	}
+	return nil
+}
+
 // Encode returns the body of the commit object:
 //
 //	tree <hash>
@@ -92,7 +105,13 @@ type CommitData struct {
 //	committer <signature>
 //	                       (an empty line)
 //	<message>
-func (c *CommitData) Encode() []byte {
+func (c *CommitData) Encode() ([]byte, error) {
+	if err := c.Author.Check(); err != nil {
+		return nil, fmt.Errorf("author: %w", err)
+	}
+	if err := c.Committer.Check(); err != nil {
+		return nil, fmt.Errorf("committer: %w", err)
+	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "tree %s\n", c.Tree)
 	for _, p := range c.Parents {
@@ -102,7 +121,7 @@ func (c *CommitData) Encode() []byte {
 	fmt.Fprintf(&b, "committer %s\n", c.Committer)
 	b.WriteString("\n")
 	b.WriteString(c.Message)
-	return b.Bytes()
+	return b.Bytes(), nil
 }
 
 // ParseCommit decodes a commit object. Headers it does not know (such as

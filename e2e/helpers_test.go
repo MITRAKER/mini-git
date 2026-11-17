@@ -20,32 +20,55 @@ func TestMain(m *testing.M) {
 		fmt.Println("skipping end-to-end tests: git is not installed")
 		os.Exit(0)
 	}
-	// `go test` caches results, but it cannot see that these tests depend on
-	// the code they build below. Reading the source files lets the cache
-	// notice when any of them changes.
-	touchSources("..")
-
-	dir, err := os.MkdirTemp("", "mgit-e2e")
-	if err != nil {
-		panic(err)
-	}
-	mgitBin = filepath.Join(dir, "mgit")
-	build := exec.Command("go", "build", "-o", mgitBin, "../cmd/mgit")
-	build.Stdout, build.Stderr = os.Stdout, os.Stderr
-	if err := build.Run(); err != nil {
-		panic("building mgit: " + err.Error())
-	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
+	os.Exit(runTests(m))
 }
 
-func touchSources(root string) {
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && (strings.HasSuffix(p, ".go") || filepath.Base(p) == "go.mod") {
-			os.ReadFile(p)
+// runTests builds mgit into a temporary folder, runs the tests and returns
+// the exit code. It is separate from TestMain so that its deferred clean-up
+// runs before os.Exit.
+func runTests(m *testing.M) int {
+	if err := touchSources(".."); err != nil {
+		fmt.Fprintln(os.Stderr, "reading the sources:", err)
+		return 1
+	}
+	dir, err := os.MkdirTemp("", "mgit-e2e")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			fmt.Fprintln(os.Stderr, "cleaning up:", err)
 		}
-		return nil
+	}()
+	mgitBin = filepath.Join(dir, "mgit")
+	args := []string{"build", "-o", mgitBin}
+	if os.Getenv("GOCOVERDIR") != "" {
+		// `make cover` sets GOCOVERDIR: build mgit so that every run records
+		// which lines it executed, and count them with the unit tests.
+		args = append(args, "-cover", "-coverpkg=github.com/MITRAKER/mini-git/...")
+	}
+	build := exec.Command("go", append(args, "../cmd/mgit")...)
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := build.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "building mgit:", err)
+		return 1
+	}
+	return m.Run()
+}
+
+// touchSources reads every Go file and go.mod under root. `go test` caches
+// results, but it cannot see that these tests depend on the code they build;
+// reading the files lets the cache notice when any of them changes.
+func touchSources(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if strings.HasSuffix(p, ".go") || filepath.Base(p) == "go.mod" {
+			_, err = os.ReadFile(p)
+		}
+		return err
 	})
 }
 
@@ -64,6 +87,7 @@ func baseEnv(dir string) map[string]string {
 		"GIT_COMMITTER_EMAIL": "committer@example.com",
 		"GIT_AUTHOR_DATE":     "2026-01-01T00:00:00Z",
 		"GIT_COMMITTER_DATE":  "2026-01-01T00:00:00Z",
+		"GOCOVERDIR":          os.Getenv("GOCOVERDIR"), // see runTests
 	}
 }
 
@@ -140,6 +164,38 @@ func writeFile(t *testing.T, dir, name, content string, perm os.FileMode) {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(p, perm); err != nil { // WriteFile keeps the mode of an existing file
+		t.Fatal(err)
+	}
+}
+
+// remove deletes a file, failing the test if it cannot.
+func remove(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// chmod changes a file's permissions, failing the test if it cannot.
+func chmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// symlink creates a symbolic link, failing the test if it cannot.
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mkdir creates a folder and its parents, failing the test if it cannot.
+func mkdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
 }

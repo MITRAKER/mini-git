@@ -8,13 +8,17 @@ import (
 
 func TestCommitReplacesFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file")
-	os.WriteFile(path, []byte("old"), 0o644)
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	l, err := Acquire(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.Write([]byte("new"))
+	if err := l.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
 	if got, _ := os.ReadFile(path); string(got) != "old" {
 		t.Fatalf("file changed before Commit: %q", got)
 	}
@@ -35,16 +39,20 @@ func TestSecondLockFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Acquire(path); err == nil {
+	if _, err2 := Acquire(path); err2 == nil {
 		t.Fatal("second Acquire succeeded while the lock was held")
 	}
-	l.Rollback()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
+	if err = l.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("Rollback created the target file")
 	}
 	l2, err := Acquire(path) // free again after Rollback
 	if err != nil {
 		t.Fatal(err)
 	}
-	l2.Rollback()
+	if err := l2.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 }

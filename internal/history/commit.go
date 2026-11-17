@@ -39,28 +39,56 @@ func Commit(r *repo.Repo, ix *index.Index, message string, allowEmpty bool) (*Re
 	if err != nil {
 		return nil, err
 	}
-
-	// 1. The snapshot.
-	tree, err := WriteTree(r.Objects, ix.Entries)
+	tree, err := WriteTree(r.Objects, ix.Entries) // step 1
 	if err != nil {
 		return nil, err
 	}
+	parents, err := parentsFor(r, head, tree, len(ix.Entries), allowEmpty)
+	if err != nil {
+		return nil, err
+	}
+	c, err := NewCommitData(r, tree, parents, message) // step 2
+	if err != nil {
+		return nil, err
+	}
+	h, err := WriteCommit(r.Objects, c)
+	if err != nil {
+		return nil, err
+	}
+	// Step 3. Passing the old value makes the update fail if someone else
+	// moved the branch while we were working.
+	target, err := r.HeadTarget()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.UpdateRef(target, h, head.Commit, head.HasCommit); err != nil {
+		return nil, err
+	}
+	return &Result{Hash: h, Commit: c, Branch: head.Branch, Root: !head.HasCommit}, nil
+}
 
-	// 2. The commit object. Its parent is whatever HEAD points to now.
-	var parents []object.Hash
-	if head.HasCommit {
-		parent, err := ReadCommit(r.Objects, head.Commit)
-		if err != nil {
-			return nil, err
-		}
-		if parent.Tree == tree && !allowEmpty {
+// parentsFor returns the new commit's parents: the commit HEAD points to, if
+// any. It refuses a commit that would change nothing, unless allowEmpty.
+func parentsFor(r *repo.Repo, head repo.Head, tree object.Hash, entries int, allowEmpty bool) ([]object.Hash, error) {
+	if !head.HasCommit {
+		if entries == 0 && !allowEmpty {
 			return nil, ErrNothingToCommit
 		}
-		parents = []object.Hash{head.Commit}
-	} else if len(ix.Entries) == 0 && !allowEmpty {
+		return nil, nil
+	}
+	parent, err := ReadCommit(r.Objects, head.Commit)
+	if err != nil {
+		return nil, err
+	}
+	if parent.Tree == tree && !allowEmpty {
 		return nil, ErrNothingToCommit
 	}
+	return []object.Hash{head.Commit}, nil
+}
 
+// NewCommitData fills in a commit for tree and parents, with the author and
+// committer taken from the environment or git config, both at the same time.
+func NewCommitData(r *repo.Repo, tree object.Hash, parents []object.Hash, message string) (*object.CommitData, error) {
 	cfg, err := config.Load(r.GitDir)
 	if err != nil {
 		return nil, err
@@ -74,26 +102,14 @@ func Commit(r *repo.Repo, ix *index.Index, message string, allowEmpty bool) (*Re
 	if err != nil {
 		return nil, err
 	}
-	c := &object.CommitData{
-		Tree:      tree,
-		Parents:   parents,
-		Author:    author,
-		Committer: committer,
-		Message:   message,
-	}
-	h, err := r.Objects.Write(object.Commit, c.Encode())
-	if err != nil {
-		return nil, err
-	}
+	return &object.CommitData{Tree: tree, Parents: parents, Author: author, Committer: committer, Message: message}, nil
+}
 
-	// 3. Move the branch. Passing the old value makes the update fail if
-	// someone else moved the branch while we were working.
-	target, err := r.HeadTarget()
+// WriteCommit stores a commit object and returns its hash.
+func WriteCommit(store *object.Store, c *object.CommitData) (object.Hash, error) {
+	body, err := c.Encode()
 	if err != nil {
-		return nil, err
+		return object.Hash{}, err
 	}
-	if err := r.UpdateRef(target, h, head.Commit, head.HasCommit); err != nil {
-		return nil, err
-	}
-	return &Result{Hash: h, Commit: c, Branch: head.Branch, Root: !head.HasCommit}, nil
+	return store.Write(object.Commit, body)
 }

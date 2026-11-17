@@ -31,7 +31,8 @@ func fillTree(t *testing.T, dir string) {
 var messyMessage = []string{"  Title with spaces   ", "\n\n\nBody line one  \nBody line two\t", "", "Last paragraph\n\n"}
 
 func commitArgs(msgs []string) []string {
-	args := []string{"commit"}
+	args := make([]string, 0, 1+2*len(msgs))
+	args = append(args, "commit")
 	for _, m := range msgs {
 		args = append(args, "-m", m)
 	}
@@ -55,11 +56,11 @@ func TestCommitsAreByteForByteIdenticalToGit(t *testing.T) {
 		{"2026-03-04T05:06:07+05:30", messyMessage, nil},
 		{"2026-03-05T10:00:00-03:30", []string{"Second commit"}, func(dir string) {
 			writeFile(t, dir, "a/x.txt", "changed\n", 0o644)
-			os.Remove(filepath.Join(dir, "a0"))
+			remove(t, filepath.Join(dir, "a0"))
 			writeFile(t, dir, "new/file", "new\n", 0o755)
 		}},
 		{"2026-03-06T00:00:00Z", []string{"Third"}, func(dir string) {
-			os.Chmod(filepath.Join(dir, "run.sh"), 0o644)
+			chmod(t, filepath.Join(dir, "run.sh"), 0o644)
 		}},
 	}
 	for i, step := range steps {
@@ -279,7 +280,7 @@ func TestCommitRespectsRefLock(t *testing.T) {
 	if git(t, dir, "rev-parse", "HEAD") != before {
 		t.Error("branch moved even though it was locked")
 	}
-	os.Remove(lock)
+	remove(t, lock)
 	mgit(t, dir, "commit", "-m", "unblocked")
 }
 

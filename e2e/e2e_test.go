@@ -3,7 +3,6 @@ package e2e
 // Tests for steps 1 and 2: objects, the index and status.
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,8 +25,8 @@ func TestInitCreatesARepoGitUnderstands(t *testing.T) {
 func TestHashObjectMatchesGit(t *testing.T) {
 	dir := newRepo(t)
 	for i, content := range []string{"", "hello world\n", "no newline", "binary\x00\xff\x01", strings.Repeat("big ", 100000)} {
-		name := filepath.Join(dir, "f"+string(rune('0'+i)))
-		os.WriteFile(name, []byte(content), 0o644)
+		name := "f" + string(rune('0'+i))
+		writeFile(t, dir, name, content, 0o644)
 		if want, got := git(t, dir, "hash-object", name), mgit(t, dir, "hash-object", name); got != want {
 			t.Errorf("content %d: mgit %q, git %q", i, got, want)
 		}
@@ -80,7 +79,7 @@ func TestAddWritesAnIndexGitCanRead(t *testing.T) {
 	writeFile(t, dir, "dir/b.txt", "b\n", 0o644)
 	writeFile(t, dir, "dir/sub/c.txt", "c\n", 0o644)
 	writeFile(t, dir, "tool.sh", "#!/bin/sh\n", 0o755)
-	os.Symlink("a.txt", filepath.Join(dir, "link"))
+	symlink(t, "a.txt", filepath.Join(dir, "link"))
 	mgit(t, dir, "add", ".")
 
 	want := git(t, dir, "ls-files", "-s")
@@ -120,14 +119,14 @@ func TestStatusMatchesGit(t *testing.T) {
 	writeFile(t, dir, "edit.txt", "v2, longer\n", 0o644)
 	writeFile(t, dir, "staged-edit.txt", "v2\n", 0o644)
 	mgit(t, dir, "add", "staged-edit.txt")
-	os.Remove(filepath.Join(dir, "remove.txt"))
-	os.Remove(filepath.Join(dir, "staged-remove.txt"))
+	remove(t, filepath.Join(dir, "remove.txt"))
+	remove(t, filepath.Join(dir, "staged-remove.txt"))
 	mgit(t, dir, "add", "staged-remove.txt")
-	os.Chmod(filepath.Join(dir, "chmod.sh"), 0o755)
+	chmod(t, filepath.Join(dir, "chmod.sh"), 0o755)
 	writeFile(t, dir, "new.txt", "new\n", 0o644)
 	writeFile(t, dir, "brand-new-dir/x.txt", "x\n", 0o644)
 	writeFile(t, dir, "brand-new-dir/deeper/y.txt", "y\n", 0o644)
-	os.MkdirAll(filepath.Join(dir, "empty-dir"), 0o755)
+	mkdir(t, filepath.Join(dir, "empty-dir"))
 	check("mixed changes")
 
 	writeFile(t, dir, "staged-new.txt", "s\n", 0o644)

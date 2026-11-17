@@ -1,0 +1,169 @@
+# golangci-lint configuration (https://golangci-lint.run), version 2 format.
+#
+# This file is where most of our coding standard is enforced automatically.
+# Each linter is tagged with the NASA/JPL "Power of Ten" rule it supports; see
+# docs/CODING_STANDARD.md for the rules themselves. CI fails on any finding
+# (rule 10: zero warnings).
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+issues:
+  # Report everything, never hide repeats.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    # Rule 1: simple control flow
+    - gocognit          # cognitive complexity per function
+    - gocyclo           # cyclomatic complexity per function
+    - nestif            # deeply nested if statements
+    - nakedret          # no naked returns in long functions
+    # Rule 3: predictable memory use
+    - prealloc          # preallocate slices when the size is known
+    - makezero          # catch append to a slice made with a length
+    # Rule 4: short functions
+    - funlen
+    # Rule 6: smallest possible scope, no mutable global state
+    - gochecknoglobals
+    - gochecknoinits
+    - wastedassign
+    - ineffassign
+    # Rule 7: check every error, validate every input
+    - errcheck
+    - errorlint         # compare and wrap errors correctly
+    - nilerr            # never return nil after checking err != nil
+    - nilnil
+    # Rules 8 and 9: no unsafe, no hidden magic
+    - depguard
+    - gocheckcompilerdirectives
+    - forbidigo
+    # Rule 10: the strictest general analyzers, zero warnings
+    - govet
+    - staticcheck
+    - unused
+    - revive
+    - gocritic
+    - unparam
+    - unconvert
+    - usestdlibvars
+    - copyloopvar
+    - intrange
+    - predeclared
+    - errname
+    - misspell
+    - dupword
+    - asciicheck
+    - bidichk           # hidden Unicode direction characters (security)
+    - thelper           # test helpers must call t.Helper()
+    - nolintlint        # every //nolint must name the linter and say why
+    # Security
+    - gosec
+
+  settings:
+    funlen:
+      lines: 60         # rule 4: one printed page
+      statements: 40
+      ignore-comments: true
+    gocognit:
+      min-complexity: 15
+    gocyclo:
+      min-complexity: 12
+    nestif:
+      min-complexity: 4
+    nakedret:
+      max-func-lines: 0 # no naked returns at all
+    errcheck:
+      check-type-assertions: true
+      check-blank: false # `_ = f()` is the explicit "ignored on purpose" (JPL's (void) cast)
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # struct field order is chosen for readability, not padding
+    staticcheck:
+      checks: ["all"]
+    revive:
+      enable-all-rules: false
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+        - name: indent-error-flow
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: receiver-naming
+        - name: increment-decrement
+        - name: unexported-return
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: early-return
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: confusing-results
+        - name: defer
+        - name: modifies-value-receiver
+    gocritic:
+      # The default checks (which include style checks such as ifElseChain
+      # and singleCaseSwitch) plus every diagnostic and performance check.
+      enabled-tags: [diagnostic, performance]
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: unsafe
+              desc: "JPL rule 9: no unsafe pointer arithmetic"
+            - pkg: reflect
+              desc: "keep code statically checkable; no reflection"
+    forbidigo:
+      forbid:
+        - pattern: ^panic$
+          msg: "JPL rules 5 and 7: return an error instead of panicking"
+        - pattern: ^recover$
+          msg: "JPL rule 1: no non-local control flow"
+        - pattern: ^print(ln)?$
+          msg: "use fmt with an explicit output stream"
+        - pattern: ^os\.Exit$
+          msg: "only main may exit; return an error instead"
+    gosec:
+      excludes:
+        # G304 "file path provided as taint input" and G703 "path traversal
+        # via taint analysis": a version control tool reads the files the
+        # user points it at by design. User paths go through repo.RelPath
+        # (which keeps them inside the working tree) and paths that come from
+        # repository data (index, trees, refs) are validated before use.
+        - G304
+        - G703
+    misspell:
+      locale: US
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    rules:
+      # Tests may be longer than production functions (table-driven tests)
+      # and may use package-level test fixtures.
+      - path: _test\.go
+        linters: [funlen, gocognit, gocyclo, gochecknoglobals, gosec, nestif]
+      # main is the one place allowed to call os.Exit.
+      - path: cmd/mgit/main\.go
+        linters: [forbidigo]
+        text: os\.Exit
+      # TestMain must exit with the test result code.
+      - path: _test\.go
+        linters: [forbidigo]
+        text: os\.Exit
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/MITRAKER/mini-git

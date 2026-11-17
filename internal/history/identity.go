@@ -33,37 +33,20 @@ const (
 // author and committer get exactly the same time.
 func Identity(cfg *config.Config, role Role, now time.Time) (object.Signature, error) {
 	env := "GIT_" + strings.ToUpper(string(role)) + "_"
-	lookup := func(envName, key, fallbackEnv string) string {
-		if v := os.Getenv(env + envName); v != "" {
-			return v
-		}
-		if v, ok := cfg.Get(string(role) + "." + key); ok && v != "" {
-			return v
-		}
-		if v, ok := cfg.Get("user." + key); ok && v != "" {
-			return v
-		}
-		if fallbackEnv != "" {
-			return os.Getenv(fallbackEnv)
-		}
-		return ""
-	}
-
 	sig := object.Signature{
-		Name:  lookup("NAME", "name", ""),
-		Email: lookup("EMAIL", "email", "EMAIL"),
-		When:  now,
+		Name: firstSet(os.Getenv(env+"NAME"), cfg.Value(string(role)+".name"), cfg.Value("user.name")),
+		Email: firstSet(os.Getenv(env+"EMAIL"), cfg.Value(string(role)+".email"), cfg.Value("user.email"),
+			os.Getenv("EMAIL")),
+		When: now,
 	}
 	if sig.Name == "" || sig.Email == "" {
 		return sig, fmt.Errorf("%s identity unknown. Tell mgit (and git) who you are:\n\n"+
 			"  git config --global user.name \"Your Name\"\n"+
 			"  git config --global user.email \"you@example.com\"", role)
 	}
-	// Git refuses names and emails that would break the "Name <email>" line.
-	if strings.ContainsAny(sig.Name, "<>\n") || strings.ContainsAny(sig.Email, "<>\n") {
-		return sig, fmt.Errorf("%s name or email contains '<', '>' or a newline", role)
+	if err := sig.Check(); err != nil {
+		return sig, fmt.Errorf("%s: %w", role, err)
 	}
-
 	if date := os.Getenv(env + "DATE"); date != "" {
 		when, err := ParseDate(date)
 		if err != nil {
@@ -72,6 +55,16 @@ func Identity(cfg *config.Config, role Role, now time.Time) (object.Signature, e
 		sig.When = when
 	}
 	return sig, nil
+}
+
+// firstSet returns the first value that is not empty.
+func firstSet(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ParseDate understands the date formats people most often put in
@@ -88,21 +81,9 @@ func Identity(cfg *config.Config, role Role, now time.Time) (object.Signature, e
 // A date with no zone is read in the local time zone.
 func ParseDate(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
-	raw := strings.TrimPrefix(s, "@")
-	if secsText, zoneText, ok := strings.Cut(raw, " "); ok {
-		if secs, err := strconv.ParseInt(secsText, 10, 64); err == nil {
-			zone, err := object.ParseZone(strings.TrimSpace(zoneText))
-			if err != nil {
-				return time.Time{}, err
-			}
-			return time.Unix(secs, 0).In(zone), nil
-		}
-	} else if strings.HasPrefix(s, "@") {
-		if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			return time.Unix(secs, 0).UTC(), nil
-		}
+	if t, ok, err := parseRawDate(s); ok || err != nil {
+		return t, err
 	}
-
 	withZone := []string{
 		time.RFC3339,
 		"2006-01-02T15:04:05-0700",
@@ -122,4 +103,36 @@ func ParseDate(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("unsupported date format %q", s)
+}
+
+// parseRawDate handles Git's internal "[@]<seconds> <zone>" format and a bare
+// "@<seconds>". ok is false when s is not in this format at all.
+func parseRawDate(s string) (t time.Time, ok bool, err error) {
+	raw := strings.TrimPrefix(s, "@")
+	secsText, zoneText, hasZone := strings.Cut(raw, " ")
+	if !isDigits(secsText) || (!hasZone && raw == s) {
+		return time.Time{}, false, nil // another format (a bare number needs '@')
+	}
+	secs, err := strconv.ParseInt(secsText, 10, 64)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("date %q: %w", s, err)
+	}
+	if !hasZone {
+		return time.Unix(secs, 0).UTC(), true, nil
+	}
+	zone, err := object.ParseZone(strings.TrimSpace(zoneText))
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return time.Unix(secs, 0).In(zone), true, nil
+}
+
+// isDigits reports whether s is a non-empty string of the digits 0-9.
+func isDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return s != ""
 }

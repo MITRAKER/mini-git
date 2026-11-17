@@ -13,7 +13,11 @@ func TestEncodeTreeUsesGitOrder(t *testing.T) {
 		{Mode: "100644", Name: "a-b", Hash: h},
 		{Mode: "100644", Name: "a0", Hash: h},
 	}
-	parsed, err := ParseTree(EncodeTree(entries))
+	raw, err := EncodeTree(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseTree(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +48,11 @@ func TestCommitRoundTrip(t *testing.T) {
 		Committer: Signature{Name: "Bob", Email: "bob@example.com", When: time.Unix(1767229200, 0).UTC()},
 		Message:   "Subject line\ncontinues\n\nBody\n",
 	}
-	raw := string(c.Encode())
+	encoded, err := c.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(encoded)
 	want := "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n" +
 		"parent " + c.Parents[0].String() + "\n" +
 		"parent " + c.Parents[1].String() + "\n" +
@@ -89,9 +97,30 @@ func TestSignatureAndZone(t *testing.T) {
 	if s.Name != "Mitra K" || s.Email != "m@example.com" || s.String() != "Mitra K <m@example.com> 1767225600 +0530" {
 		t.Errorf("round trip = %q", s.String())
 	}
-	for _, bad := range []string{"no email 1 +0000", "A <a@b>", "A <a@b> x +0000", "A <a@b> 1 0530", "A <a@b> 1 +05:30"} {
+	for _, bad := range []string{"no email 1 +0000", "A <a@b>", "A <a@b> x +0000", "A <a@b> 1 0530", "A <a@b> 1 +05:30",
+		"A <a@b> 1 +0560"} {
 		if _, err := ParseSignature(bad); err == nil {
 			t.Errorf("ParseSignature(%q) succeeded", bad)
+		}
+	}
+}
+
+func TestEncodeRejectsBadSignatures(t *testing.T) {
+	good := Signature{Name: "Ada", Email: "ada@example.com", When: time.Unix(0, 0).UTC()}
+	for _, bad := range []Signature{
+		{Name: "", Email: "a@b"},
+		{Name: "Ada", Email: ""},
+		{Name: "Ada <evil>", Email: "a@b"},
+		{Name: "Ada", Email: "a@b>\ncommitter Eve"},
+		{Name: "Ada\nparent 0000", Email: "a@b"},
+	} {
+		c := &CommitData{Tree: Compute(Tree, nil), Author: bad, Committer: good, Message: "m\n"}
+		if _, err := c.Encode(); err == nil {
+			t.Errorf("Encode accepted author %q <%q>", bad.Name, bad.Email)
+		}
+		c.Author, c.Committer = good, bad
+		if _, err := c.Encode(); err == nil {
+			t.Errorf("Encode accepted committer %q <%q>", bad.Name, bad.Email)
 		}
 	}
 }

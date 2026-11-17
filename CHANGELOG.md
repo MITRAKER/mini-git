@@ -1,0 +1,62 @@
+# Changelog
+
+All notable changes to mini-git are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+While the version starts with 0, a new minor version may include breaking
+changes.
+
+## [Unreleased]
+
+### Added
+
+- **Object store**
+  - `init`, `hash-object` (`-w`, `-t`, `--stdin`) and `cat-file` (`-t`, `-s`, `-p`, `-e`).
+  - Objects are stored zlib-compressed and named by their SHA-1 hash, in Git's
+    exact format, and written atomically (a temporary file, then a rename).
+  - Objects can be named by a short, unique prefix of their hash.
+- **Staging area**
+  - `add` for files, folders and deleted files.
+  - `status` in the long format and with `--short`, whose output is the same
+    as `git status --porcelain`.
+  - `ls-files`, with `-s` for the mode, hash and stage of each entry.
+  - The index uses Git's binary format, version 2, with its checksum, and is
+    updated safely through a lock file (`.git/index.lock`).
+- **History**
+  - `commit` (`-m`, `-F`, `-a`, `--allow-empty`), `write-tree`, `commit-tree`,
+    `log` (`--oneline`, `-n <number>` or `-<number>`, and revisions to start
+    from) and `rev-parse` (`--short`).
+  - Revision names: `HEAD`, `@`, branch and tag names, short hashes, `~n`,
+    `^n`, `^{type}`, `^{}`, `<rev>:<path>` and `:<path>`.
+  - The author and committer identity comes from the `GIT_AUTHOR_*` and
+    `GIT_COMMITTER_*` environment variables, or from `user.name` and
+    `user.email` in git config.
+  - Commits are byte-for-byte identical to git's: the same files, identity,
+    date and message give the same commit hash.
+- **Engineering**
+  - Continuous integration with GitHub Actions: tests on Linux and macOS with
+    Go 1.26 and 1.27, a Windows cross-compile, and a `go mod tidy` check.
+  - golangci-lint v2 with strict settings. Any warning fails the build.
+  - Test coverage, including the end-to-end tests, with a minimum threshold
+    enforced in CI.
+  - Security checks: govulncheck, CodeQL, OpenSSF Scorecard, and dependency
+    review on pull requests.
+  - Dependabot updates for Go modules and GitHub Actions, grouped into one
+    weekly pull request for each.
+  - A release workflow: pushing a `v*` tag builds binaries for Linux, macOS
+    and Windows (amd64 and arm64) with SHA-256 checksums, and publishes a
+    GitHub Release with the notes from this changelog.
+  - `mgit version` prints the version, which release builds stamp in.
+  - A Makefile for the common tasks. `make check` runs everything CI runs.
+  - pre-commit hooks: formatting, vet and lint before each commit, and the
+    tests before each push.
+  - A coding standard that adapts NASA/JPL's "Power of Ten" rules to Go
+    (`docs/CODING_STANDARD.md`).
+  - Issue forms, a pull request template, a contributing guide, a security
+    policy and a code of conduct.
+- **Learning**
+  - `LEARNING.md` with lessons 0 to 4: one lesson per build step, explaining
+    how and why each part was built.
+
+[Unreleased]: https://github.com/MITRAKER/mini-git/commits/main

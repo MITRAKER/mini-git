@@ -2,11 +2,8 @@ package main
 
 import (
 	"errors"
-	"flag"
 	"fmt"
-	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/MITRAKER/mini-git/internal/index"
@@ -32,39 +29,47 @@ func runAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-
 	for _, arg := range args {
-		rel, err := r.RelPath(arg)
-		if err != nil {
+		if err := addPath(r, ix, arg); err != nil {
 			return err
-		}
-		abs := r.AbsPath(rel)
-		fi, err := os.Lstat(abs)
-
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			removed := ix.RemoveUnder(rel + "/")
-			if ix.Remove(rel) {
-				removed++
-			}
-			if removed == 0 {
-				return fmt.Errorf("pathspec '%s' did not match any files", arg)
-			}
-		case err != nil:
-			return err
-		case fi.IsDir():
-			if err := addDir(r, ix, rel); err != nil {
-				return err
-			}
-		default:
-			if err := addFile(r, ix, rel, fi); err != nil {
-				return err
-			}
 		}
 	}
 	return ix.Write(r.IndexPath())
 }
 
+// addPath stages one path given on the command line.
+func addPath(r *repo.Repo, ix *index.Index, arg string) error {
+	rel, err := r.RelPath(arg)
+	if err != nil {
+		return err
+	}
+	fi, err := os.Lstat(r.AbsPath(rel))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return stageDeletion(ix, rel, arg)
+	case err != nil:
+		return err
+	case fi.IsDir():
+		return addDir(r, ix, rel)
+	default:
+		return addFile(r, ix, rel, fi)
+	}
+}
+
+// stageDeletion forgets a path that is gone from disk: a file, or every
+// tracked file under a deleted folder.
+func stageDeletion(ix *index.Index, rel, arg string) error {
+	removed := ix.RemoveUnder(rel + "/")
+	if ix.Remove(rel) {
+		removed++
+	}
+	if removed == 0 {
+		return fmt.Errorf("pathspec '%s' did not match any files", arg)
+	}
+	return nil
+}
+
+// addFile stores one file as a blob and records it in the index.
 func addFile(r *repo.Repo, ix *index.Index, rel string, fi os.FileInfo) error {
 	content, err := repo.ReadWorktreeFile(r.AbsPath(rel), fi)
 	if err != nil {
@@ -74,55 +79,61 @@ func addFile(r *repo.Repo, ix *index.Index, rel string, fi os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	ix.Set(index.NewEntry(rel, fi, h))
+	return ix.Set(index.NewEntry(rel, fi, h))
+}
+
+// addDir stages everything under the folder rel: new and changed files, and
+// the deletion of tracked files that are gone. Symbolic links are added as
+// links, never followed, the same as Git does.
+func addDir(r *repo.Repo, ix *index.Index, rel string) error {
+	if err := forgetDeleted(r, ix, rel); err != nil {
+		return err
+	}
+	files, err := r.ListFiles(rel)
+	if err != nil {
+		return err
+	}
+	for _, p := range files {
+		fi, err := os.Lstat(r.AbsPath(p))
+		if err != nil {
+			return err
+		}
+		if err := addFile(r, ix, p, fi); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func addDir(r *repo.Repo, ix *index.Index, rel string) error {
-	// First forget tracked files under this folder that were deleted.
+// forgetDeleted removes the tracked files under the folder rel that are no
+// longer on disk.
+func forgetDeleted(r *repo.Repo, ix *index.Index, rel string) error {
 	prefix := ""
 	if rel != "" {
 		prefix = rel + "/"
 	}
 	var gone []string
 	for _, e := range ix.Entries {
-		if strings.HasPrefix(e.Path, prefix) {
-			if _, err := os.Lstat(r.AbsPath(e.Path)); errors.Is(err, os.ErrNotExist) {
-				gone = append(gone, e.Path)
-			}
+		if !strings.HasPrefix(e.Path, prefix) {
+			continue
+		}
+		_, found, err := r.StatTracked(e.Path)
+		if err != nil {
+			return err
+		}
+		if !found {
+			gone = append(gone, e.Path)
 		}
 	}
 	for _, p := range gone {
 		ix.Remove(p)
 	}
-
-	// Then add every file. WalkDir does not follow symlinks, so a link to a
-	// folder is stored as a link, the same as Git does.
-	return filepath.WalkDir(r.AbsPath(rel), func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if d.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		fi, err := os.Lstat(p)
-		if err != nil {
-			return err
-		}
-		fileRel, err := r.RelPath(p)
-		if err != nil {
-			return err
-		}
-		return addFile(r, ix, fileRel, fi)
-	})
+	return nil
 }
 
 // mgit ls-files [-s]
-func runLsFiles(args []string) error {
-	fs := flag.NewFlagSet("ls-files", flag.ContinueOnError)
+func runLsFiles(args []string, out *output) error {
+	fs := newFlagSet("ls-files")
 	stage := fs.Bool("s", false, "show mode, blob hash and stage number")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -137,17 +148,17 @@ func runLsFiles(args []string) error {
 	}
 	for _, e := range ix.Entries {
 		if *stage {
-			fmt.Printf("%06o %s %d\t%s\n", e.Mode, e.Hash, e.Stage, e.Path)
+			out.printf("%06o %s %d\t%s\n", e.Mode, e.Hash, e.Stage, e.Path)
 		} else {
-			fmt.Println(e.Path)
+			out.printf("%s\n", e.Path)
 		}
 	}
 	return nil
 }
 
 // mgit status [--short]
-func runStatus(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+func runStatus(args []string, out *output) error {
+	fs := newFlagSet("status")
 	short := fs.Bool("short", false, "print one line per path, like `git status --short`")
 	fs.BoolVar(short, "s", false, "same as --short")
 	if err := fs.Parse(args); err != nil {
@@ -166,61 +177,70 @@ func runStatus(args []string) error {
 		return err
 	}
 	if *short {
-		printShortStatus(res)
+		printShortStatus(out, res)
 	} else {
-		printLongStatus(res)
+		printLongStatus(out, res)
 	}
 	return nil
 }
 
-func printShortStatus(res *status.Result) {
+func printShortStatus(out *output, res *status.Result) {
 	for _, c := range res.Changes {
-		fmt.Printf("%c%c %s\n", c.Staged, c.Unstaged, c.Path)
+		out.printf("%c%c %s\n", c.Staged, c.Unstaged, c.Path)
 	}
 	for _, p := range res.Untracked {
-		fmt.Printf("?? %s\n", p)
+		out.printf("?? %s\n", p)
 	}
 }
 
-var labels = map[byte]string{
-	status.Added:    "new file:   ",
-	status.Modified: "modified:   ",
-	status.Deleted:  "deleted:    ",
+// label is how the long status format names a change.
+func label(code byte) string {
+	switch code {
+	case status.Added:
+		return "new file:   "
+	case status.Modified:
+		return "modified:   "
+	case status.Deleted:
+		return "deleted:    "
+	}
+	return ""
 }
 
-func printLongStatus(res *status.Result) {
+func printLongStatus(out *output, res *status.Result) {
 	if res.Head.Branch != "" {
-		fmt.Printf("On branch %s\n", res.Head.Branch)
+		out.printf("On branch %s\n", res.Head.Branch)
 	} else {
-		fmt.Printf("HEAD detached at %s\n", res.Head.Commit.String()[:7])
+		out.printf("HEAD detached at %s\n", res.Head.Commit.String()[:7])
 	}
 	if !res.Head.HasCommit {
-		fmt.Print("\nNo commits yet\n")
+		out.printf("\nNo commits yet\n")
 	}
-
-	var staged, unstaged []string
+	staged := make([]string, 0, len(res.Changes))
+	unstaged := make([]string, 0, len(res.Changes))
 	for _, c := range res.Changes {
 		if c.Staged != status.Unchanged {
-			staged = append(staged, labels[c.Staged]+c.Path)
+			staged = append(staged, label(c.Staged)+c.Path)
 		}
 		if c.Unstaged != status.Unchanged {
-			unstaged = append(unstaged, labels[c.Unstaged]+c.Path)
+			unstaged = append(unstaged, label(c.Unstaged)+c.Path)
 		}
 	}
-	section := func(title, hint string, lines []string) {
-		if len(lines) == 0 {
-			return
-		}
-		fmt.Printf("\n%s\n  (%s)\n", title, hint)
-		for _, l := range lines {
-			fmt.Printf("\t%s\n", l)
-		}
-	}
-	section("Changes to be committed:", "these will go into the next commit", staged)
-	section("Changes not staged for commit:", "use \"mgit add <file>...\" to stage them", unstaged)
-	section("Untracked files:", "use \"mgit add <file>...\" to start tracking them", res.Untracked)
-
+	printSection(out, "Changes to be committed:", "these will go into the next commit", staged)
+	printSection(out, "Changes not staged for commit:", `use "mgit add <file>..." to stage them`, unstaged)
+	printSection(out, "Untracked files:", `use "mgit add <file>..." to start tracking them`, res.Untracked)
 	if len(staged)+len(unstaged)+len(res.Untracked) == 0 {
-		fmt.Print("\nnothing to commit, working tree clean\n")
+		out.printf("\nnothing to commit, working tree clean\n")
+	}
+}
+
+// printSection prints one titled list of the long status format, if the
+// list is not empty.
+func printSection(out *output, title, hint string, lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	out.printf("\n%s\n  (%s)\n", title, hint)
+	for _, l := range lines {
+		out.printf("\t%s\n", l)
 	}
 }

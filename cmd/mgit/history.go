@@ -2,15 +2,11 @@ package main
 
 import (
 	"errors"
-	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/MITRAKER/mini-git/internal/config"
 	"github.com/MITRAKER/mini-git/internal/history"
 	"github.com/MITRAKER/mini-git/internal/index"
 	"github.com/MITRAKER/mini-git/internal/object"
@@ -21,12 +17,16 @@ import (
 // stringList is a flag that can be given more than once: -m a -m b.
 type stringList []string
 
-func (s *stringList) String() string     { return strings.Join(*s, ", ") }
-func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
+func (s *stringList) String() string { return strings.Join(*s, ", ") }
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
 
 // mgit commit [-a] [--allow-empty] (-m <message>... | -F <file>)
-func runCommit(args []string) error {
-	fs := flag.NewFlagSet("commit", flag.ContinueOnError)
+func runCommit(args []string, out *output) error {
+	fs := newFlagSet("commit")
 	var messages stringList
 	fs.Var(&messages, "m", "commit message (repeat for more paragraphs)")
 	file := fs.String("F", "", "read the commit message from a file (- for standard input)")
@@ -38,48 +38,46 @@ func runCommit(args []string) error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q (mgit commit takes no paths; use mgit add first)", fs.Arg(0))
 	}
-
-	var message string
-	switch {
-	case len(messages) > 0 && *file != "":
-		return errors.New("use -m or -F, not both")
-	case len(messages) > 0:
-		message = history.JoinParagraphs(messages)
-	case *file == "-":
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
-		message = string(data)
-	case *file != "":
-		data, err := os.ReadFile(*file)
-		if err != nil {
-			return err
-		}
-		message = string(data)
-	default:
-		return errors.New("give a commit message with -m \"message\" (mgit has no editor)")
+	message, err := commitMessage(messages, *file)
+	if err != nil {
+		return err
 	}
-
 	r, err := findRepo()
 	if err != nil {
 		return err
 	}
-	ix, err := index.Read(r.IndexPath())
+	ix, err := commitIndex(r, *all)
 	if err != nil {
 		return err
 	}
-	if *all {
-		if err := stageTrackedChanges(r, ix); err != nil {
-			return err
-		}
-	}
-
 	res, err := history.Commit(r, ix, history.CleanupMessage(message), *allowEmpty)
 	if err != nil {
 		return err
 	}
+	out.printf("[%s %s] %s\n", commitWhere(res), r.Objects.Abbrev(res.Hash, 7), res.Commit.Subject())
+	return nil
+}
 
+// commitMessage reads the message from the -m options (one paragraph each)
+// or from the -F file.
+func commitMessage(messages []string, file string) (string, error) {
+	switch {
+	case len(messages) > 0 && file != "":
+		return "", errors.New("use -m or -F, not both")
+	case len(messages) > 0:
+		return history.JoinParagraphs(messages), nil
+	case file == "-":
+		data, err := readLimited(os.Stdin, "standard input")
+		return string(data), err
+	case file != "":
+		data, err := readFileLimited(file)
+		return string(data), err
+	}
+	return "", errors.New(`give a commit message with -m "message" (mgit has no editor)`)
+}
+
+// commitWhere is the "main (root-commit)" part of commit's output.
+func commitWhere(res *history.Result) string {
 	where := res.Branch
 	if where == "" {
 		where = "detached HEAD"
@@ -87,8 +85,20 @@ func runCommit(args []string) error {
 	if res.Root {
 		where += " (root-commit)"
 	}
-	fmt.Printf("[%s %s] %s\n", where, r.Objects.Abbrev(res.Hash, 7), res.Commit.Subject())
-	return nil
+	return where
+}
+
+// commitIndex reads the index; with -a it first stages every tracked file
+// that changed.
+func commitIndex(r *repo.Repo, all bool) (*index.Index, error) {
+	ix, err := index.Read(r.IndexPath())
+	if err != nil || !all {
+		return ix, err
+	}
+	if err := stageTrackedChanges(r, ix); err != nil {
+		return nil, err
+	}
+	return ix, nil
 }
 
 // stageTrackedChanges is `commit -a`: re-add every tracked file that changed
@@ -96,15 +106,13 @@ func runCommit(args []string) error {
 func stageTrackedChanges(r *repo.Repo, ix *index.Index) error {
 	var gone []string
 	for _, e := range ix.Entries {
-		fi, err := os.Lstat(r.AbsPath(e.Path))
-		if errors.Is(err, os.ErrNotExist) {
-			gone = append(gone, e.Path)
-			continue
-		}
-		if err != nil {
+		fi, found, err := r.StatTracked(e.Path)
+		switch {
+		case err != nil:
 			return err
-		}
-		if !e.StatMatches(fi) {
+		case !found:
+			gone = append(gone, e.Path)
+		case !e.StatMatches(fi):
 			if err := addFile(r, ix, e.Path, fi); err != nil {
 				return err
 			}
@@ -129,28 +137,20 @@ func parseLogArgs(args []string) (logOptions, error) {
 	opts := logOptions{limit: -1}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		count := ""
 		switch {
 		case a == "--oneline":
 			opts.oneline = true
 			continue
-		case a == "-n" || a == "--max-count":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s needs a number", a)
-			}
-			i++
-			count = args[i]
-		case strings.HasPrefix(a, "--max-count="):
-			count = strings.TrimPrefix(a, "--max-count=")
-		case strings.HasPrefix(a, "-n"):
-			count = a[2:]
-		case len(a) > 1 && a[0] == '-' && a[1] >= '0' && a[1] <= '9':
-			count = a[1:] // -5 means -n 5
-		case strings.HasPrefix(a, "-"):
-			return opts, fmt.Errorf("unknown option %q", a)
-		default:
+		case !strings.HasPrefix(a, "-"):
 			opts.revs = append(opts.revs, a)
 			continue
+		}
+		count, usedNext, err := countOption(a, args[i+1:])
+		if err != nil {
+			return opts, err
+		}
+		if usedNext {
+			i++
 		}
 		n, err := strconv.Atoi(count)
 		if err != nil || n < 0 {
@@ -161,8 +161,28 @@ func parseLogArgs(args []string) (logOptions, error) {
 	return opts, nil
 }
 
+// countOption reads the number given by -n N, -nN, --max-count N,
+// --max-count=N or -N. usedNext is true when the number was the next
+// argument, rest[0].
+func countOption(a string, rest []string) (count string, usedNext bool, err error) {
+	switch {
+	case a == "-n" || a == "--max-count":
+		if len(rest) == 0 {
+			return "", false, fmt.Errorf("%s needs a number", a)
+		}
+		return rest[0], true, nil
+	case strings.HasPrefix(a, "--max-count="):
+		return strings.TrimPrefix(a, "--max-count="), false, nil
+	case strings.HasPrefix(a, "-n"):
+		return a[2:], false, nil
+	case len(a) > 1 && a[1] >= '0' && a[1] <= '9':
+		return a[1:], false, nil // -5 means -n 5
+	}
+	return "", false, fmt.Errorf("unknown option %q", a)
+}
+
 // mgit log [--oneline] [-n <count> | -<count>] [<revision>...]
-func runLog(args []string) error {
+func runLog(args []string, out *output) error {
 	opts, err := parseLogArgs(args)
 	if err != nil {
 		return err
@@ -171,59 +191,83 @@ func runLog(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(opts.revs) == 0 {
-		head, err := r.Head()
+	starts, err := logStarts(r, opts.revs)
+	if err != nil {
+		return err
+	}
+	w, err := history.NewWalker(r.Objects, starts)
+	if err != nil {
+		return err
+	}
+	limit := opts.limit
+	if limit < 0 {
+		limit = history.MaxWalk // no -n: the walk's own upper bound
+	}
+	for shown := range limit {
+		h, c, ok, err := w.Next()
 		if err != nil {
 			return err
 		}
-		if !head.HasCommit {
-			return fmt.Errorf("your current branch '%s' does not have any commits yet", head.Branch)
-		}
-		opts.revs = []string{"HEAD"}
-	}
-	var starts []object.Hash
-	for _, name := range opts.revs {
-		h, err := revision.Resolve(r, name)
-		if err != nil {
-			return err
-		}
-		if h, err = revision.Peel(r, h, object.Commit); err != nil {
-			return err
-		}
-		starts = append(starts, h)
-	}
-
-	shown := 0
-	return history.Walk(r.Objects, starts, func(h object.Hash, c *object.CommitData) (bool, error) {
-		if opts.limit >= 0 && shown >= opts.limit {
-			return false, nil
+		if !ok {
+			return nil // no more commits
 		}
 		if opts.oneline {
-			fmt.Printf("%s %s\n", r.Objects.Abbrev(h, 7), c.Subject())
-		} else {
-			if shown > 0 {
-				fmt.Println()
-			}
-			printCommit(r, h, c)
+			out.printf("%s %s\n", r.Objects.Abbrev(h, 7), c.Subject())
+			continue
 		}
-		shown++
-		return true, nil
-	})
+		if shown > 0 {
+			out.printf("\n")
+		}
+		printCommit(out, r, h, c)
+	}
+	return nil
+}
+
+// logStarts resolves the revisions log starts from: HEAD by default.
+func logStarts(r *repo.Repo, revs []string) ([]object.Hash, error) {
+	if len(revs) > 0 {
+		return resolveAll(r, revs, object.Commit)
+	}
+	head, err := r.Head()
+	if err != nil {
+		return nil, err
+	}
+	if !head.HasCommit {
+		return nil, fmt.Errorf("your current branch '%s' does not have any commits yet", head.Branch)
+	}
+	return []object.Hash{head.Commit}, nil
+}
+
+// resolveAll resolves each name and follows it to an object of type want,
+// so that, for example, a tag can be given where a commit is needed.
+func resolveAll(r *repo.Repo, names []string, want object.Type) ([]object.Hash, error) {
+	hashes := make([]object.Hash, 0, len(names))
+	for _, name := range names {
+		h, err := revision.Resolve(r, name)
+		if err != nil {
+			return nil, err
+		}
+		if h, err = revision.Peel(r, h, want); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, h)
+	}
+	return hashes, nil
 }
 
 // printCommit prints one commit in Git's default ("medium") format.
-func printCommit(r *repo.Repo, h object.Hash, c *object.CommitData) {
-	fmt.Printf("commit %s\n", h)
+func printCommit(out *output, r *repo.Repo, h object.Hash, c *object.CommitData) {
+	out.printf("commit %s\n", h)
 	if len(c.Parents) > 1 {
 		short := make([]string, len(c.Parents))
 		for i, p := range c.Parents {
 			short[i] = r.Objects.Abbrev(p, 7)
 		}
-		fmt.Printf("Merge: %s\n", strings.Join(short, " "))
+		out.printf("Merge: %s\n", strings.Join(short, " "))
 	}
-	fmt.Printf("Author: %s <%s>\n", c.Author.Name, c.Author.Email)
+	out.printf("Author: %s <%s>\n", c.Author.Name, c.Author.Email)
 	// Shown in the author's own time zone, like Git.
-	fmt.Printf("Date:   %s\n\n", c.Author.When.Format("Mon Jan 2 15:04:05 2006 -0700"))
+	out.printf("Date:   %s\n\n", c.Author.When.Format("Mon Jan 2 15:04:05 2006 -0700"))
 
 	lines := strings.Split(strings.TrimRight(c.Message, "\n"), "\n")
 	start := 0
@@ -231,14 +275,14 @@ func printCommit(r *repo.Repo, h object.Hash, c *object.CommitData) {
 		start++ // Git skips blank lines at the top of a message
 	}
 	for _, line := range lines[start:] {
-		fmt.Printf("    %s\n", line)
+		out.printf("    %s\n", line)
 	}
 }
 
 // mgit write-tree
-func runWriteTree(args []string) error {
+func runWriteTree(args []string, out *output) error {
 	if len(args) > 0 {
-		return errors.New("usage: mgit write-tree")
+		return usageError("mgit write-tree")
 	}
 	r, err := findRepo()
 	if err != nil {
@@ -252,88 +296,73 @@ func runWriteTree(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(h)
+	out.printf("%s\n", h)
 	return nil
 }
 
-// mgit commit-tree <tree> [-p <parent>]... [-m <message>]...
+// mgit commit-tree [-p <parent>]... [-m <message>]... <tree>
 //
 // Creates a commit object and prints its hash, without moving any branch.
-// Note: Go's flag package stops at the first non-flag argument, so the flags
-// come first: mgit commit-tree -p HEAD -m "msg" <tree>
-func runCommitTree(args []string) error {
-	fs := flag.NewFlagSet("commit-tree", flag.ContinueOnError)
-	var parents, messages stringList
-	fs.Var(&parents, "p", "a parent commit (repeat for a merge)")
+// Go's flag package stops at the first argument that is not a flag, so the
+// flags come first: mgit commit-tree -p HEAD -m "msg" <tree>
+func runCommitTree(args []string, out *output) error {
+	fs := newFlagSet("commit-tree")
+	var parentNames, messages stringList
+	fs.Var(&parentNames, "p", "a parent commit (repeat for a merge)")
 	fs.Var(&messages, "m", "commit message (repeat for more paragraphs)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: mgit commit-tree [-p <parent>]... [-m <message>]... <tree>")
+		return usageError("mgit commit-tree [-p <parent>]... [-m <message>]... <tree>")
 	}
 	r, err := findRepo()
 	if err != nil {
 		return err
 	}
-
-	tree, err := revision.Resolve(r, fs.Arg(0))
+	trees, err := resolveAll(r, fs.Args(), object.Tree)
 	if err != nil {
 		return err
 	}
-	if tree, err = revision.Peel(r, tree, object.Tree); err != nil {
-		return err
-	}
-	c := &object.CommitData{Tree: tree}
-	for _, p := range parents {
-		h, err := revision.Resolve(r, p)
-		if err != nil {
-			return err
-		}
-		if h, err = revision.Peel(r, h, object.Commit); err != nil {
-			return err
-		}
-		c.Parents = append(c.Parents, h)
-	}
-
-	if len(messages) > 0 {
-		c.Message = history.JoinParagraphs(messages)
-	} else {
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
-		c.Message = string(data)
-	}
-
-	cfg, err := config.Load(r.GitDir)
+	parents, err := resolveAll(r, parentNames, object.Commit)
 	if err != nil {
 		return err
 	}
-	now := time.Now()
-	if c.Author, err = history.Identity(cfg, history.Author, now); err != nil {
-		return err
-	}
-	if c.Committer, err = history.Identity(cfg, history.Committer, now); err != nil {
-		return err
-	}
-	h, err := r.Objects.Write(object.Commit, c.Encode())
+	message, err := commitTreeMessage(messages)
 	if err != nil {
 		return err
 	}
-	fmt.Println(h)
+	c, err := history.NewCommitData(r, trees[0], parents, message)
+	if err != nil {
+		return err
+	}
+	h, err := history.WriteCommit(r.Objects, c)
+	if err != nil {
+		return err
+	}
+	out.printf("%s\n", h)
 	return nil
 }
 
+// commitTreeMessage returns the -m paragraphs, or else the message read
+// from standard input, as `git commit-tree` does.
+func commitTreeMessage(messages []string) (string, error) {
+	if len(messages) > 0 {
+		return history.JoinParagraphs(messages), nil
+	}
+	data, err := readLimited(os.Stdin, "standard input")
+	return string(data), err
+}
+
 // mgit rev-parse [--short] <revision>...
-func runRevParse(args []string) error {
-	fs := flag.NewFlagSet("rev-parse", flag.ContinueOnError)
+func runRevParse(args []string, out *output) error {
+	fs := newFlagSet("rev-parse")
 	short := fs.Bool("short", false, "print the shortest unique prefix (at least 7 characters)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: mgit rev-parse [--short] <revision>...")
+		return usageError("mgit rev-parse [--short] <revision>...")
 	}
 	r, err := findRepo()
 	if err != nil {
@@ -345,9 +374,9 @@ func runRevParse(args []string) error {
 			return err
 		}
 		if *short {
-			fmt.Println(r.Objects.Abbrev(h, 7))
+			out.printf("%s\n", r.Objects.Abbrev(h, 7))
 		} else {
-			fmt.Println(h)
+			out.printf("%s\n", h)
 		}
 	}
 	return nil

@@ -15,7 +15,7 @@ package object
 import (
 	"bytes"
 	"compress/zlib"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: SHA-1 is required by Git's object format, not used for security here
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -37,6 +37,22 @@ const (
 	Tag    Type = "tag"    // an annotated tag pointing at another object
 )
 
+// Limits that keep memory use predictable (coding standard, rule 3).
+const (
+	// MaxSize is the largest object mgit will read or write: 1 GiB.
+	MaxSize = 1 << 30
+	// maxHeaderLen bounds the "<type> <size>\x00" header: "commit " plus
+	// at most 20 digits plus the NUL fits easily.
+	maxHeaderLen = 32
+	// MinAbbrev is the shortest hash prefix mgit accepts or prints.
+	MinAbbrev = 4
+	// maxDeflateRatio is the most zlib can compress data: about 1032 to 1.
+	// A header that claims more content than that is corrupt; checking it
+	// before allocating means a tiny hostile file cannot make mgit allocate
+	// a gigabyte.
+	maxDeflateRatio = 1032
+)
+
 // ParseType checks that s names a known object type.
 func ParseType(s string) (Type, error) {
 	switch t := Type(s); t {
@@ -55,7 +71,7 @@ func (h Hash) String() string { return hex.EncodeToString(h[:]) }
 // ParseHash parses a full 40-character hex hash.
 func ParseHash(s string) (Hash, error) {
 	var h Hash
-	if len(s) != 40 {
+	if len(s) != 2*len(h) {
 		return h, fmt.Errorf("invalid hash %q: want 40 hex characters", s)
 	}
 	if _, err := hex.Decode(h[:], []byte(s)); err != nil {
@@ -73,7 +89,7 @@ func encode(t Type, data []byte) []byte {
 // Compute returns the hash an object of type t with this data would have.
 // It does not write anything.
 func Compute(t Type, data []byte) Hash {
-	return sha1.Sum(encode(t, data))
+	return sha1.Sum(encode(t, data)) //nolint:gosec // G401: SHA-1 is Git's object name, not a security control
 }
 
 // ErrNotFound is returned when no object matches a name.
@@ -103,8 +119,14 @@ func (s *Store) Has(h Hash) bool {
 // Write stores an object and returns its hash. Writing the same content twice
 // is free: the second write finds the file already there and stops.
 func (s *Store) Write(t Type, data []byte) (Hash, error) {
+	if _, err := ParseType(string(t)); err != nil {
+		return Hash{}, err
+	}
+	if len(data) > MaxSize {
+		return Hash{}, fmt.Errorf("object of %d bytes is larger than the %d byte limit", len(data), MaxSize)
+	}
 	raw := encode(t, data)
-	h := Hash(sha1.Sum(raw))
+	h := Hash(sha1.Sum(raw)) //nolint:gosec // G401: SHA-1 is Git's object name, not a security control
 	if s.Has(h) {
 		return h, nil
 	}
@@ -117,76 +139,127 @@ func (s *Store) Write(t Type, data []byte) (Hash, error) {
 	if err := zw.Close(); err != nil {
 		return h, err
 	}
-
-	dest := s.path(h)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return h, err
-	}
-	// Write to a temporary file, then rename it into place. A rename is
-	// atomic, so a crash never leaves a half-written object behind.
-	tmp, err := os.CreateTemp(filepath.Dir(dest), "tmp_obj_")
-	if err != nil {
-		return h, err
-	}
-	defer os.Remove(tmp.Name()) // no-op once the rename has succeeded
-	if _, err := tmp.Write(buf.Bytes()); err != nil {
-		tmp.Close()
-		return h, err
-	}
-	if err := tmp.Close(); err != nil {
-		return h, err
-	}
-	if err := os.Chmod(tmp.Name(), 0o444); err != nil { // objects never change
-		return h, err
-	}
-	return h, os.Rename(tmp.Name(), dest)
+	return h, writeAtomically(s.path(h), buf.Bytes())
 }
 
-// Read loads an object, checks its header and returns its type and data.
+// writeAtomically writes data to a temporary file next to dest, then renames
+// it into place. A rename is atomic, so a crash never leaves a half-written
+// object behind.
+func writeAtomically(dest string, data []byte) error {
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // G301: same permissions as git, so the repository stays readable
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "tmp_obj_")
+	if err != nil {
+		return err
+	}
+	_, writeErr := tmp.Write(data)
+	closeErr := tmp.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return errors.Join(err, os.Remove(tmp.Name()))
+	}
+	// Objects never change once written, so make the file read-only.
+	if err := os.Chmod(tmp.Name(), 0o444); err != nil { //nolint:gosec // G302: read-only for everyone, like Git's objects
+		return errors.Join(err, os.Remove(tmp.Name()))
+	}
+	if err := os.Rename(tmp.Name(), dest); err != nil {
+		return errors.Join(err, os.Remove(tmp.Name()))
+	}
+	return nil
+}
+
+// Read loads an object, checks it and returns its type and data. The checks
+// are: the header is well formed, the size is within MaxSize and matches the
+// data, and the SHA-1 of the bytes is really h (so a corrupted file is caught).
 func (s *Store) Read(h Hash) (Type, []byte, error) {
-	f, err := os.Open(s.path(h))
+	compressed, err := os.ReadFile(s.path(h))
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil, fmt.Errorf("%s: %w", h, ErrNotFound)
 	}
 	if err != nil {
 		return "", nil, err
 	}
-	defer f.Close()
-
-	zr, err := zlib.NewReader(f)
+	t, data, err := decode(compressed)
 	if err != nil {
 		return "", nil, fmt.Errorf("object %s is corrupt: %w", h, err)
 	}
-	defer zr.Close()
-	raw, err := io.ReadAll(zr)
-	if err != nil {
-		return "", nil, fmt.Errorf("object %s is corrupt: %w", h, err)
+	if Compute(t, data) != h {
+		return "", nil, fmt.Errorf("object %s is corrupt: its contents hash to %s", h, Compute(t, data))
 	}
+	return t, data, nil
+}
 
-	nul := bytes.IndexByte(raw, 0)
-	if nul < 0 {
-		return "", nil, fmt.Errorf("object %s is corrupt: no header", h)
+// decode decompresses an object file. It reads the header first and then
+// exactly as many bytes as the header announces, so a corrupt or hostile
+// file cannot make mgit allocate more than MaxSize.
+func decode(compressed []byte) (Type, []byte, error) {
+	zr, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return "", nil, err
 	}
-	typeStr, sizeStr, ok := strings.Cut(string(raw[:nul]), " ")
+	t, size, err := readHeader(zr)
+	if err != nil {
+		return "", nil, errors.Join(err, zr.Close())
+	}
+	if int64(size) > int64(len(compressed))*maxDeflateRatio {
+		return "", nil, errors.Join(fmt.Errorf("header claims %d bytes, more than %d compressed bytes can hold",
+			size, len(compressed)), zr.Close())
+	}
+	data := make([]byte, size)
+	if _, err = io.ReadFull(zr, data); err != nil {
+		return "", nil, errors.Join(fmt.Errorf("content is shorter than its header says: %w", err), zr.Close())
+	}
+	// There must be nothing after the announced content. Reading to the end
+	// also makes zlib verify its checksum.
+	extra, err := io.ReadAll(io.LimitReader(zr, 1))
+	if err != nil {
+		return "", nil, errors.Join(err, zr.Close())
+	}
+	if len(extra) > 0 {
+		return "", nil, errors.Join(errors.New("content is longer than its header says"), zr.Close())
+	}
+	return t, data, zr.Close()
+}
+
+// readHeader reads "<type> <size>\x00" one byte at a time, never more than
+// maxHeaderLen bytes.
+func readHeader(r io.Reader) (Type, int, error) {
+	var header []byte
+	b := make([]byte, 1)
+	for len(header) < maxHeaderLen {
+		if _, err := io.ReadFull(r, b); err != nil {
+			return "", 0, fmt.Errorf("truncated header: %w", err)
+		}
+		if b[0] == 0 {
+			return parseHeader(string(header))
+		}
+		header = append(header, b[0])
+	}
+	return "", 0, fmt.Errorf("header longer than %d bytes", maxHeaderLen)
+}
+
+func parseHeader(header string) (Type, int, error) {
+	typeStr, sizeStr, ok := strings.Cut(header, " ")
 	if !ok {
-		return "", nil, fmt.Errorf("object %s is corrupt: bad header", h)
+		return "", 0, fmt.Errorf("bad header %q", header)
 	}
 	t, err := ParseType(typeStr)
 	if err != nil {
-		return "", nil, fmt.Errorf("object %s is corrupt: %w", h, err)
+		return "", 0, err
 	}
-	data := raw[nul+1:]
-	if size, err := strconv.Atoi(sizeStr); err != nil || size != len(data) {
-		return "", nil, fmt.Errorf("object %s is corrupt: size mismatch", h)
+	size, err := strconv.Atoi(sizeStr)
+	if err != nil || size < 0 || size > MaxSize {
+		return "", 0, fmt.Errorf("bad size %q in header", sizeStr)
 	}
-	return t, data, nil
+	return t, size, nil
 }
 
 // Resolve turns a full hash or a unique prefix of at least 4 hex characters
 // into a full hash, the way `git cat-file -p 3b18e5` works.
 func (s *Store) Resolve(name string) (Hash, error) {
 	name = strings.ToLower(name)
-	if len(name) == 40 {
+	if len(name) == 2*len(Hash{}) {
 		h, err := ParseHash(name)
 		if err != nil {
 			return h, err
@@ -196,25 +269,12 @@ func (s *Store) Resolve(name string) (Hash, error) {
 		}
 		return h, nil
 	}
-	if len(name) < 4 || len(name) > 40 {
-		return Hash{}, fmt.Errorf("%q: an object name needs 4 to 40 hex characters", name)
+	if len(name) < MinAbbrev || len(name) > 2*len(Hash{}) || !isHex(name) {
+		return Hash{}, fmt.Errorf("%q is not a hex object name of %d to 40 characters", name, MinAbbrev)
 	}
-	if _, err := hex.DecodeString(name[:len(name)/2*2]); err != nil {
-		return Hash{}, fmt.Errorf("%q is not a hex object name", name)
-	}
-
-	entries, err := os.ReadDir(filepath.Join(s.dir, name[:2]))
-	if errors.Is(err, os.ErrNotExist) {
-		return Hash{}, fmt.Errorf("%s: %w", name, ErrNotFound)
-	}
+	matches, err := s.withPrefix(name)
 	if err != nil {
 		return Hash{}, err
-	}
-	var matches []string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), name[2:]) && len(e.Name()) == 38 {
-			matches = append(matches, name[:2]+e.Name())
-		}
 	}
 	switch len(matches) {
 	case 0:
@@ -226,28 +286,73 @@ func (s *Store) Resolve(name string) (Hash, error) {
 	}
 }
 
-// Abbrev returns the shortest prefix of h, at least min characters long, that
-// no other object in the store shares. This is how `git log --oneline` picks
-// how many characters of each hash to show.
-func (s *Store) Abbrev(h Hash, min int) string {
-	hx := h.String()
-	n := min
-	entries, _ := os.ReadDir(filepath.Join(s.dir, hx[:2]))
+// withPrefix lists the full hashes of all objects that start with prefix
+// (at least 2 characters). They all live in the same objects/xx/ folder.
+func (s *Store) withPrefix(prefix string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(s.dir, prefix[:2]))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var matches []string
 	for _, e := range entries {
-		other := hx[:2] + e.Name()
-		if other == hx || len(other) != 40 {
+		full := prefix[:2] + e.Name()
+		if len(full) == 2*len(Hash{}) && isHex(full) && strings.HasPrefix(full, prefix) {
+			matches = append(matches, full)
+		}
+	}
+	return matches, nil
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Abbrev returns the shortest prefix of h, at least minLen characters long,
+// that no other object in the store shares. This is how `git log --oneline`
+// picks how many characters of each hash to show.
+func (s *Store) Abbrev(h Hash, minLen int) string {
+	hx := h.String()
+	n := max(minLen, MinAbbrev)
+	others, err := s.withPrefix(hx[:2])
+	if err != nil {
+		return hx // cannot list the folder: the full hash is always unique
+	}
+	for _, other := range others {
+		if other == hx {
 			continue
 		}
 		common := 0
-		for common < 40 && other[common] == hx[common] {
+		for common < len(hx) && other[common] == hx[common] {
 			common++
 		}
-		if common+1 > n {
-			n = common + 1
-		}
+		n = max(n, common+1)
 	}
-	if n > 40 {
-		n = 40
+	return hx[:min(n, len(hx))]
+}
+
+// Check verifies that data is a well-formed object of type t. `git
+// hash-object` makes the same check before it stores a tree, commit or tag,
+// so a mistake cannot create a corrupt object. Any bytes are a valid blob.
+func Check(t Type, data []byte) error {
+	switch t {
+	case Tree:
+		_, err := ParseTree(data)
+		return err
+	case Commit:
+		_, err := ParseCommit(data)
+		return err
+	case Tag:
+		_, err := TagTarget(data)
+		return err
 	}
-	return hx[:n]
+	_, err := ParseType(string(t))
+	return err
 }

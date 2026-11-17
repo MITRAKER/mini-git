@@ -8,10 +8,11 @@
 package status
 
 import (
-	"errors"
+	"fmt"
 	"os"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/MITRAKER/mini-git/internal/history"
 	"github.com/MITRAKER/mini-git/internal/index"
@@ -26,6 +27,10 @@ const (
 	Modified  byte = 'M'
 	Deleted   byte = 'D'
 )
+
+// maxDirs bounds how many folders one status visits (coding standard,
+// rule 2).
+const maxDirs = 1 << 20
 
 // Change is one tracked path that differs somewhere.
 type Change struct {
@@ -47,134 +52,221 @@ func Compute(r *repo.Repo, ix *index.Index) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{Head: head}
-
-	// 1. Flatten the last commit's tree into path -> file.
-	committed := map[string]history.File{}
-	if head.HasCommit {
-		commit, err := history.ReadCommit(r.Objects, head.Commit)
-		if err != nil {
-			return nil, err
-		}
-		if committed, err = history.FlattenTree(r.Objects, commit.Tree); err != nil {
-			return nil, err
-		}
+	committed, err := headFiles(r, head)
+	if err != nil {
+		return nil, err
 	}
+	changes, err := diff(r, ix, committed)
+	if err != nil {
+		return nil, err
+	}
+	untracked, err := findUntracked(r, ix)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Head: head, Changes: changes, Untracked: untracked}, nil
+}
 
-	changes := map[string]*Change{}
-	get := func(p string) *Change {
-		if c, ok := changes[p]; ok {
-			return c
-		}
-		c := &Change{Path: p, Staged: Unchanged, Unstaged: Unchanged}
-		changes[p] = c
+// diff compares the snapshots: HEAD with the index, and the index with the
+// working tree. It returns the changed paths in order.
+func diff(r *repo.Repo, ix *index.Index, committed map[string]history.File) ([]Change, error) {
+	changes := changeSet{}
+	changes.compareHeadToIndex(committed, ix)
+	if err := changes.compareIndexToWorktree(r, ix); err != nil {
+		return nil, err
+	}
+	return changes.sorted(), nil
+}
+
+// headFiles flattens the last commit's tree into path -> file. Before the
+// first commit nothing is committed yet.
+func headFiles(r *repo.Repo, head repo.Head) (map[string]history.File, error) {
+	if !head.HasCommit {
+		return map[string]history.File{}, nil
+	}
+	commit, err := history.ReadCommit(r.Objects, head.Commit)
+	if err != nil {
+		return nil, err
+	}
+	return history.FlattenTree(r.Objects, commit.Tree)
+}
+
+// changeSet collects one Change per path.
+type changeSet map[string]*Change
+
+// get returns the Change for p, creating it if needed.
+func (s changeSet) get(p string) *Change {
+	if c, ok := s[p]; ok {
 		return c
 	}
+	c := &Change{Path: p, Staged: Unchanged, Unstaged: Unchanged}
+	s[p] = c
+	return c
+}
 
-	// 2. HEAD vs index: what the next commit would change.
+// compareHeadToIndex finds what the next commit would change.
+func (s changeSet) compareHeadToIndex(committed map[string]history.File, ix *index.Index) {
 	for _, e := range ix.Entries {
 		old, ok := committed[e.Path]
 		switch {
 		case !ok:
-			get(e.Path).Staged = Added
+			s.get(e.Path).Staged = Added
 		case old.Hash != e.Hash || old.Mode != e.Mode:
-			get(e.Path).Staged = Modified
+			s.get(e.Path).Staged = Modified
 		}
 	}
 	for p := range committed {
 		if ix.Get(p) == nil {
-			get(p).Staged = Deleted
+			s.get(p).Staged = Deleted
 		}
 	}
-
-	// 3. Index vs working tree: edits you have not staged with `add` yet.
-	for _, e := range ix.Entries {
-		abs := r.AbsPath(e.Path)
-		fi, err := os.Lstat(abs)
-		if errors.Is(err, os.ErrNotExist) || (err == nil && fi.IsDir()) {
-			get(e.Path).Unstaged = Deleted
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if e.StatMatches(fi) {
-			continue // fast path: same size and timestamp, assume unchanged
-		}
-		content, err := repo.ReadWorktreeFile(abs, fi)
-		if err != nil {
-			return nil, err
-		}
-		if object.Compute(object.Blob, content) != e.Hash || index.ModeOf(fi) != e.Mode {
-			get(e.Path).Unstaged = Modified
-		}
-	}
-
-	for _, c := range changes {
-		res.Changes = append(res.Changes, *c)
-	}
-	sort.Slice(res.Changes, func(i, j int) bool { return res.Changes[i].Path < res.Changes[j].Path })
-
-	// 4. Files on disk that are not in the index.
-	res.Untracked, err = findUntracked(r, ix)
-	return res, err
 }
 
-// findUntracked lists files the index does not track. Like Git, a folder that
-// holds no tracked files is reported once as "folder/" instead of file by file.
-func findUntracked(r *repo.Repo, ix *index.Index) ([]string, error) {
-	trackedDirs := map[string]bool{}
+// compareIndexToWorktree finds edits you have not staged with `add` yet.
+func (s changeSet) compareIndexToWorktree(r *repo.Repo, ix *index.Index) error {
 	for _, e := range ix.Entries {
-		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
-			trackedDirs[d] = true
-		}
-	}
-
-	var out []string
-	var walk func(rel string) error
-	walk = func(rel string) error {
-		entries, err := os.ReadDir(r.AbsPath(rel))
+		code, err := worktreeChange(r, e)
 		if err != nil {
 			return err
 		}
-		for _, de := range entries {
-			if de.Name() == ".git" {
-				continue
-			}
-			child := path.Join(rel, de.Name())
-			switch {
-			case !de.IsDir():
-				if ix.Get(child) == nil {
-					out = append(out, child)
-				}
-			case trackedDirs[child]:
-				if err := walk(child); err != nil {
-					return err
-				}
-			case hasFiles(r.AbsPath(child)):
-				out = append(out, child+"/")
-			}
+		if code != Unchanged {
+			s.get(e.Path).Unstaged = code
 		}
-		return nil
 	}
-	err := walk("")
-	sort.Strings(out)
-	return out, err
+	return nil
 }
 
-// hasFiles reports whether a folder contains at least one file at any depth.
-// Git does not track empty folders, so status does not mention them.
-func hasFiles(dir string) bool {
-	entries, err := os.ReadDir(dir)
+// worktreeChange compares one index entry with the file on disk.
+func worktreeChange(r *repo.Repo, e *index.Entry) (byte, error) {
+	fi, found, err := r.StatTracked(e.Path)
+	switch {
+	case err != nil:
+		return Unchanged, err
+	case !found:
+		return Deleted, nil
+	case e.StatMatches(fi):
+		return Unchanged, nil // fast path: same size and timestamps
+	case index.ModeOf(fi) != e.Mode:
+		return Modified, nil
+	}
+	content, err := repo.ReadWorktreeFile(r.AbsPath(e.Path), fi)
 	if err != nil {
-		return false
+		return Unchanged, err
+	}
+	if object.Compute(object.Blob, content) != e.Hash {
+		return Modified, nil
+	}
+	return Unchanged, nil
+}
+
+// sorted returns the changes in path order.
+func (s changeSet) sorted() []Change {
+	paths := make([]string, 0, len(s))
+	for p := range s {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	out := make([]Change, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, *s[p])
+	}
+	return out
+}
+
+// untrackedWalker visits, with an explicit stack instead of recursion
+// (coding standard, rule 1), the folders that hold tracked files.
+type untrackedWalker struct {
+	r       *repo.Repo
+	ix      *index.Index
+	tracked map[string]bool // folders with at least one tracked file inside
+	stack   []string        // folders still to visit
+	found   []string
+}
+
+// findUntracked lists files the index does not track. Like Git, a folder that
+// holds no tracked files is reported once as "folder/" instead of file by
+// file, and a folder with no files at all is not reported (Git does not
+// track empty folders).
+func findUntracked(r *repo.Repo, ix *index.Index) ([]string, error) {
+	w := &untrackedWalker{r: r, ix: ix, tracked: trackedDirs(ix), stack: []string{""}}
+	for visited := 0; len(w.stack) > 0; visited++ {
+		if visited >= maxDirs {
+			return nil, fmt.Errorf("more than %d folders in the working tree", maxDirs)
+		}
+		dir := w.stack[len(w.stack)-1]
+		w.stack = w.stack[:len(w.stack)-1]
+		if err := w.visit(dir); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(w.found)
+	return w.found, nil
+}
+
+// visit looks at what one folder holds.
+func (w *untrackedWalker) visit(dir string) error {
+	entries, err := os.ReadDir(w.r.AbsPath(dir))
+	if err != nil {
+		return err
 	}
 	for _, de := range entries {
-		if de.Name() == ".git" {
-			continue
+		child := repo.JoinPath(dir, de.Name())
+		switch {
+		case repo.IsGitDirName(de.Name()):
+			continue // .git folders are never content
+		case !de.IsDir():
+			if w.ix.Get(child) == nil {
+				w.found = append(w.found, child)
+			}
+		case w.tracked[child]:
+			w.stack = append(w.stack, child)
+		case hasFiles(w.r, child):
+			w.found = append(w.found, child+"/")
 		}
-		if !de.IsDir() || hasFiles(dir+string(os.PathSeparator)+de.Name()) {
-			return true
+	}
+	return nil
+}
+
+// trackedDirs returns every folder that holds a tracked file at any depth.
+func trackedDirs(ix *index.Index) map[string]bool {
+	dirs := map[string]bool{}
+	for _, e := range ix.Entries {
+		d := e.Path
+		for range strings.Count(e.Path, "/") {
+			d = path.Dir(d)
+			if dirs[d] {
+				break // its parents are recorded already
+			}
+			dirs[d] = true
+		}
+	}
+	return dirs
+}
+
+// hasFiles reports whether the folder dir holds at least one file at any
+// depth. It stops at the first one. Like Git, it skips folders it cannot
+// read.
+func hasFiles(r *repo.Repo, dir string) bool {
+	stack := []string{dir}
+	for visited := 0; len(stack) > 0; visited++ {
+		if visited >= maxDirs {
+			return true // too many folders to search: report it rather than hide it
+		}
+		d := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		entries, err := os.ReadDir(r.AbsPath(d))
+		if err != nil {
+			continue // unreadable: nothing in it can be added either
+		}
+		for _, de := range entries {
+			switch {
+			case repo.IsGitDirName(de.Name()):
+				continue
+			case !de.IsDir():
+				return true
+			default:
+				stack = append(stack, repo.JoinPath(d, de.Name()))
+			}
 		}
 	}
 	return false
