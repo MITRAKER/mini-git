@@ -366,9 +366,13 @@ The Power of Ten is about the code. These practices protect the rest:
 - **The race detector.** CI runs every test with `-race`, on Linux and macOS,
   with the two supported Go releases.
 - **Formatting.** `gofmt`, with imports grouped by `goimports`.
-- **Dependencies.** mgit uses only Go's standard library. Dependabot keeps Go
-  and the GitHub Actions up to date, and dependency review blocks a pull
-  request that would add a vulnerable dependency.
+- **Dependencies.** mgit uses only Go's standard library, so Go itself is
+  its one dependency: the `toolchain` line in `go.mod` makes every build use a
+  Go release with the latest security fixes, and govulncheck fails CI, on
+  every pull request and every Monday, when that release has a known
+  vulnerability in code mgit calls. Dependabot keeps
+  the GitHub Actions up to date, and dependency review blocks a pull request
+  that would add a vulnerable dependency.
 - **Supply chain.** Workflows get the least permissions they need
   (`contents: read` unless they must write), never keep the GitHub token in
   the checkout (`persist-credentials: false`), and OpenSSF Scorecard grades

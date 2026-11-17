@@ -55,6 +55,9 @@ changes.
     enforced in CI.
   - Security checks: govulncheck, CodeQL, OpenSSF Scorecard, and dependency
     review on pull requests.
+  - Builds use Go 1.26.11 or newer (the `toolchain` line in `go.mod`), which
+    fixes GO-2026-4602 in Go 1.26.0. govulncheck found it on the first CI
+    run.
   - Dependabot updates for Go modules and GitHub Actions, grouped into one
     weekly pull request for each.
   - A release workflow: pushing a `v*` tag builds binaries for Linux, macOS

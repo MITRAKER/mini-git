@@ -42,7 +42,7 @@ you find a security problem, please do not open an issue: follow
 
 | Tool | Version | What it is for |
 |------|---------|----------------|
-| [Go](https://go.dev/dl/) | 1.26 or newer | building and testing mgit (`go.mod` says `go 1.26.0`) |
+| [Go](https://go.dev/dl/) | 1.26 or newer | building and testing mgit. If yours is older than 1.26.11, Go downloads 1.26.11 by itself, because the `toolchain` line in `go.mod` asks for that patched release |
 | [git](https://git-scm.com/downloads) | 2.30 or newer | the end-to-end tests, which compare mgit with real git |
 | make | GNU make | running the tasks in the [table below](#make-targets) |
 | [golangci-lint](https://golangci-lint.run/) | v2 | the linter; its settings are in `.golangci.yml` |

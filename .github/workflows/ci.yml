@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Every Monday too, so that govulncheck reports a vulnerability published
+  # since the last change (in Go itself, for example) within a week.
+  schedule:
+    - cron: "17 5 * * 1"
   workflow_dispatch:
 
 # A newer push to the same branch or pull request cancels the older run.

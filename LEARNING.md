@@ -625,8 +625,8 @@ make by hand.
 
 On a healthy repository, mgit prints exactly what it printed before. What
 changed is how it behaves on a broken or hostile repository, and how fast a
-mistake is caught. Along the way, the new checks found six real bugs
-(section 4.5).
+mistake is caught. Along the way, the new checks found six real bugs in mgit,
+and a security hole in the Go version it was built with (section 4.5).
 
 ### 4.1 Continuous integration: machines check every change
 
@@ -649,7 +649,8 @@ fresh virtual machines.
                                           Release workflow ◀──────────┘
                                           (binaries, checksums, release notes)
 
- every week: Dependabot (updates), CodeQL (security), OpenSSF Scorecard (practices)
+ every week: CI (new vulnerabilities), Dependabot (updates), CodeQL (security),
+             OpenSSF Scorecard (practices)
 ```
 
 Here is the test job of [`ci.yml`](.github/workflows/ci.yml), trimmed a little:
@@ -780,7 +781,9 @@ code and the Go version against the Go vulnerability database. Unlike most
 scanners, it reports a vulnerability only when mgit actually *calls* the
 affected function, because it follows the call graph. mgit uses only Go's
 standard library, so a finding would be in Go itself, and the fix would be a
-newer Go.
+newer Go (section 4.5 tells how that happened on the first run). New
+vulnerabilities are published all the time, so CI also runs every Monday,
+even when nothing changed.
 
 **CodeQL** is GitHub's code scanner. It turns the code into a database and
 runs security queries over it, such as "can text from a file reach the path
@@ -993,6 +996,25 @@ None of these needed an exotic tool. Each was found by making a rule
 explicit (check every error, bound every allocation) and then writing the
 test that holds the code to it.
 
+**And one in Go itself.** On the very first CI run of this work, the
+govulncheck job failed. Go's vulnerability database lists GO-2026-4602, a
+bug in the `os` package of Go 1.26.0 ("FileInfo can escape from a Root"), and
+govulncheck showed the path by which mgit reaches it: `repo.ListFiles` calls
+`os.ReadDir`, one of the affected functions. mgit does not use `os.Root`, so
+the hole was probably not exploitable through mgit, but the safe fix costs
+one line. `go.mod` now names the Go release to build with:
+
+```
+go 1.26.0             // the oldest Go that can compile mgit
+toolchain go1.26.11   // the Go to build with: the 1.26 release with the fix
+```
+
+With Go's default setting, `GOTOOLCHAIN=auto`, an older Go that reads this
+file downloads go1.26.11 and runs it instead, on your machine and in CI. So
+every test run and every release binary uses the fixed version. That is the
+scanner's everyday job: not finding exotic attacks, but telling you the day
+something you depend on, here Go itself, has a known hole.
+
 ### Try it
 
 ```sh
@@ -1051,7 +1073,9 @@ mgit cat-file -p ef0101        # corrupt: content is longer than its header says
 5. Read [`release.yml`](.github/workflows/release.yml). What happens, step
    by step, when someone pushes the tag `v0.1.0`? What if `CHANGELOG.md` has
    no `## [0.1.0]` section?
-6. Harder: OpenSSF Scorecard prefers pinning each action to a full commit
+6. Inside the repository, run `go version`, then `GOTOOLCHAIN=local go version`.
+   Why can they print different versions? Which line of `go.mod` decides?
+7. Harder: OpenSSF Scorecard prefers pinning each action to a full commit
    hash (`actions/checkout@<40 hex characters>`) instead of a tag like `@v4`.
    Why is a tag weaker? How does Dependabot keep pinned hashes up to date?
 
