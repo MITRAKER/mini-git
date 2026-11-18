@@ -1,0 +1,66 @@
+# pre-commit runs quick checks on your machine before each commit, and the
+# tests before each push, so most problems are caught before CI sees them.
+#
+# Install the hooks once (needs Python):
+#
+#   pip install pre-commit && pre-commit install
+#
+# or simply run `make hooks`. To run every hook on every file by hand:
+#
+#   pre-commit run --all-files
+#
+# The Go hooks use the go, gofmt and golangci-lint found on your PATH, the
+# same tools that `make check` uses. More at https://pre-commit.com.
+
+# The stage names pre-commit and pre-push need pre-commit 3.2.0 or newer.
+minimum_pre_commit_version: "3.2.0"
+default_install_hook_types: [pre-commit, pre-push]
+# Hooks run before each commit unless they choose their own stages. `go test`
+# runs only before a push, because it takes longer.
+default_stages: [pre-commit]
+# Test fixtures in testdata folders must stay byte-for-byte as committed.
+exclude: '(^|/)testdata/'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        # Two spaces at the end of a Markdown line are a line break: keep them.
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt (check formatting)
+        description: Fails if gofmt would change a staged Go file. Run `make fmt` to fix it.
+        language: system
+        entry: sh -c 'unformatted=$(gofmt -l "$@") || exit 1; if [ -n "$unformatted" ]; then echo "These files need formatting (run make fmt):"; echo "$unformatted"; exit 1; fi' --
+        types: [go]
+
+      - id: go-vet
+        name: go vet
+        language: system
+        entry: go vet ./...
+        pass_filenames: false
+        types: [go]
+
+      - id: golangci-lint
+        name: golangci-lint
+        language: system
+        entry: golangci-lint run
+        pass_filenames: false
+        types: [go]
+
+      - id: go-test
+        name: go test
+        language: system
+        entry: go test ./...
+        pass_filenames: false
+        stages: [pre-push]
