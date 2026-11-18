@@ -117,12 +117,15 @@ func forgetDeleted(r *repo.Repo, ix *index.Index, rel string) error {
 		if !strings.HasPrefix(e.Path, prefix) {
 			continue
 		}
-		_, found, err := r.StatTracked(e.Path)
-		if err != nil {
+		fi, found, err := r.StatTracked(e.Path)
+		switch {
+		case err != nil:
 			return err
-		}
-		if !found {
+		case !found:
 			gone = append(gone, e.Path)
+		case !repo.IsFileOrLink(fi.Mode()):
+			// ListFiles skips special files, so say why this one is not added.
+			return fmt.Errorf("%s: can only add regular files and symbolic links", e.Path)
 		}
 	}
 	for _, p := range gone {
@@ -202,6 +205,8 @@ func label(code byte) string {
 		return "modified:   "
 	case status.Deleted:
 		return "deleted:    "
+	case status.TypeChanged:
+		return "typechange: "
 	}
 	return ""
 }

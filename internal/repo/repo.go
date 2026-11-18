@@ -158,8 +158,8 @@ func IsGitDirName(name string) bool { return strings.EqualFold(name, ".git") }
 
 // ListFiles returns every file and symbolic link under the repository folder
 // rel ("" for the whole working tree), as sorted repository paths. It skips
-// .git folders. Symbolic links to folders are listed, not followed, which is
-// what Git does too.
+// .git folders and special files (see IsFileOrLink). Symbolic links to
+// folders are listed, not followed, which is what Git does too.
 //
 // It walks the folders with an explicit stack instead of a recursive
 // function (coding standard, rule 1), and visits at most maxWalkDirs folders.
@@ -183,14 +183,22 @@ func (r *Repo) ListFiles(rel string) ([]string, error) {
 				continue
 			case de.IsDir():
 				stack = append(stack, child)
-			default:
+			case IsFileOrLink(de.Type()):
 				files = append(files, child)
 			}
+			// Anything else (a FIFO, a socket or a device) is skipped, as
+			// Git does: it cannot be stored in a commit.
 		}
 	}
 	sort.Strings(files)
 	return files, nil
 }
+
+// IsFileOrLink reports whether a file mode is something Git can track: a
+// regular file or a symbolic link. FIFOs, sockets and devices are not, and
+// mgit never opens them: opening a FIFO waits until another program writes
+// to it, which could be forever.
+func IsFileOrLink(m os.FileMode) bool { return m.IsRegular() || m&os.ModeSymlink != 0 }
 
 // JoinPath joins a repository folder and a name with "/"; dir "" is the root.
 func JoinPath(dir, name string) string {
@@ -206,6 +214,9 @@ func ReadWorktreeFile(path string, fi os.FileInfo) ([]byte, error) {
 	if fi.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(path)
 		return []byte(filepath.ToSlash(target)), err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: can only add regular files and symbolic links", path)
 	}
 	if fi.Size() > object.MaxSize {
 		return nil, fmt.Errorf("%s is %d bytes, larger than mgit's %d byte limit", path, fi.Size(), object.MaxSize)

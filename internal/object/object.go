@@ -207,7 +207,10 @@ func (s *Store) Read(h Hash) (Type, []byte, error) {
 // exactly as many bytes as the header announces, so a corrupt or hostile
 // file cannot make mgit allocate more than MaxSize.
 func decode(compressed []byte) (Type, []byte, error) {
-	zr, err := zlib.NewReader(bytes.NewReader(compressed))
+	// A bytes.Reader lets zlib read exactly up to the end of its stream (no
+	// read-ahead buffer), so whatever is left in br afterwards is garbage.
+	br := bytes.NewReader(compressed)
+	zr, err := zlib.NewReader(br)
 	if err != nil {
 		return "", nil, err
 	}
@@ -231,6 +234,9 @@ func decode(compressed []byte) (Type, []byte, error) {
 	}
 	if len(extra) > 0 {
 		return "", nil, errors.Join(errors.New("content is longer than its header says"), zr.Close())
+	}
+	if br.Len() > 0 {
+		return "", nil, errors.Join(errors.New("garbage after the end of the compressed data"), zr.Close())
 	}
 	return t, data, zr.Close()
 }

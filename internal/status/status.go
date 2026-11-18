@@ -22,10 +22,11 @@ import (
 
 // Status codes, the same letters `git status --short` prints.
 const (
-	Unchanged byte = ' '
-	Added     byte = 'A'
-	Modified  byte = 'M'
-	Deleted   byte = 'D'
+	Unchanged   byte = ' '
+	Added       byte = 'A'
+	Modified    byte = 'M'
+	Deleted     byte = 'D'
+	TypeChanged byte = 'T' // a file became a symbolic link, or the other way round
 )
 
 // maxDirs bounds how many folders one status visits (coding standard,
@@ -111,6 +112,8 @@ func (s changeSet) compareHeadToIndex(committed map[string]history.File, ix *ind
 		switch {
 		case !ok:
 			s.get(e.Path).Staged = Added
+		case !index.SameKind(old.Mode, e.Mode):
+			s.get(e.Path).Staged = TypeChanged
 		case old.Hash != e.Hash || old.Mode != e.Mode:
 			s.get(e.Path).Staged = Modified
 		}
@@ -146,8 +149,12 @@ func worktreeChange(r *repo.Repo, e *index.Entry) (byte, error) {
 		return Deleted, nil
 	case e.StatMatches(fi):
 		return Unchanged, nil // fast path: same size and timestamps
+	case !index.SameKind(index.ModeOf(fi), e.Mode):
+		return TypeChanged, nil
 	case index.ModeOf(fi) != e.Mode:
 		return Modified, nil
+	case !repo.IsFileOrLink(fi.Mode()):
+		return Modified, nil // a FIFO or other special file: never open it
 	}
 	content, err := repo.ReadWorktreeFile(r.AbsPath(e.Path), fi)
 	if err != nil {
@@ -215,8 +222,8 @@ func (w *untrackedWalker) visit(dir string) error {
 		case repo.IsGitDirName(de.Name()):
 			continue // .git folders are never content
 		case !de.IsDir():
-			if w.ix.Get(child) == nil {
-				w.found = append(w.found, child)
+			if w.ix.Get(child) == nil && repo.IsFileOrLink(de.Type()) {
+				w.found = append(w.found, child) // special files cannot be added, so Git skips them
 			}
 		case w.tracked[child]:
 			w.stack = append(w.stack, child)
@@ -267,10 +274,10 @@ func hasFiles(r *repo.Repo, dir string) bool {
 			switch {
 			case repo.IsGitDirName(de.Name()):
 				continue
-			case !de.IsDir():
-				return true
-			default:
+			case de.IsDir():
 				stack = append(stack, repo.JoinPath(d, de.Name()))
+			case repo.IsFileOrLink(de.Type()):
+				return true
 			}
 		}
 	}

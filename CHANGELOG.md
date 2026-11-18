@@ -26,6 +26,11 @@ changes.
     updated safely through a lock file (`.git/index.lock`).
   - `status`, `add` and `commit -a` handle a tracked file that was replaced by
     a folder, or a folder replaced by a file, the way git does.
+  - `status` shows a file that became a symbolic link, or the other way
+    round, as a type change (`T`, "typechange:"), as git does.
+  - FIFOs, sockets and devices in the working tree are skipped like git
+    skips them, and never opened: `add` and `status` used to wait forever on
+    a FIFO.
 - **History**
   - `commit` (`-m`, `-F`, `-a`, `--allow-empty`), `write-tree`, `commit-tree`,
     `log` (`--oneline`, `-n <number>` or `-<number>`, and revisions to start
@@ -41,6 +46,8 @@ changes.
   - Every file mgit reads, and standard input, has a size limit, and an
     object's header is checked before memory is allocated for it. A corrupt
     or hostile repository gives an error instead of using up the memory.
+  - An object file with extra bytes after its compressed data is reported as
+    corrupt, as git does.
   - Trees, folders and history are walked with loops that have fixed limits,
     never with recursion, so deeply nested or looping data (such as symbolic
     refs that point to each other) gives an error instead of a hang or a

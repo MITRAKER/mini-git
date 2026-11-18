@@ -346,8 +346,9 @@ example, Git names objects with SHA-1, so the object store must use it:
 
 The `//nolint` comments in mgit today are all of this kind: SHA-1 (required
 by Git's formats), file permissions that match Git's own (`0o755` folders,
-`0o644` files, `0o444` objects), and one conversion needed on 32-bit
-platforms. Rules that never fit a whole kind of code are turned off for it in
+`0o644` files, `0o444` objects), the `int64` conversions needed on 32-bit
+platforms, and the index's entry count, which the format stores as a 32-bit
+number (no real index comes near 2^32 entries). Rules that never fit a whole kind of code are turned off for it in
 `.golangci.yml`, each with a comment that explains why (for example,
 `os.Exit` is allowed only in `main` and in `TestMain`).
 

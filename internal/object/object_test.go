@@ -145,6 +145,31 @@ func TestReadRejectsCorruptObjects(t *testing.T) {
 	}
 }
 
+// Bytes after the end of the zlib stream mean the file is damaged, even
+// though the object inside it is fine. Git refuses it: "garbage at end of
+// loose object".
+func TestReadRejectsGarbageAfterTheData(t *testing.T) {
+	s := NewStore(t.TempDir())
+	h, err := s.Write(Blob, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chmod(s.path(h), 0o644); err != nil { // objects are read-only
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(s.path(h), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString("junk")
+	if err = errors.Join(err, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Read(h); err == nil || !strings.Contains(err.Error(), "garbage") {
+		t.Errorf("Read = %v, want a garbage error", err)
+	}
+}
+
 func TestWriteRejectsUnknownType(t *testing.T) {
 	if _, err := NewStore(t.TempDir()).Write("bogus", nil); err == nil {
 		t.Error("Write accepted an unknown type")

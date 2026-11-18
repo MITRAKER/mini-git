@@ -148,6 +148,67 @@ func TestStatusMatchesGit(t *testing.T) {
 	check("file and folder swapped")
 }
 
+// A file that becomes a symbolic link, or the other way round, is a "type
+// change": T in the short format, "typechange:" in the long one.
+func TestStatusShowsTypeChangesLikeGit(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init", "-q", "-b", "main")
+	writeFile(t, dir, "target", "x\n", 0o644)
+	writeFile(t, dir, "becomes-link", "y\n", 0o644)
+	symlink(t, "target", filepath.Join(dir, "becomes-file"))
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-q", "-m", "base")
+
+	remove(t, filepath.Join(dir, "becomes-link"))
+	symlink(t, "target", filepath.Join(dir, "becomes-link"))
+	remove(t, filepath.Join(dir, "becomes-file"))
+	writeFile(t, dir, "becomes-file", "now a file\n", 0o644)
+	for _, step := range []string{"unstaged", "staged"} {
+		if step == "staged" {
+			mgit(t, dir, "add", "becomes-link")
+		}
+		want := git(t, dir, "status", "--porcelain")
+		if got := mgit(t, dir, "status", "--short"); got != want {
+			t.Fatalf("%s:\nmgit:\n%sgit:\n%s", step, got, want)
+		}
+		if long := mgit(t, dir, "status"); !strings.Contains(long, "typechange: becomes-file") {
+			t.Errorf("%s: long status has no typechange line:\n%s", step, long)
+		}
+	}
+}
+
+// Git can only store regular files and symbolic links. A FIFO (named pipe)
+// must be skipped and never opened: opening one waits for a program to write
+// to it, which could be forever. Before this was fixed, both commands below
+// hung.
+func TestFIFOsAreSkippedLikeGit(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init", "-q", "-b", "main")
+	writeFile(t, dir, "a.txt", "a\n", 0o644)
+	writeFile(t, dir, "tracked", "t\n", 0o644)
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-q", "-m", "base")
+
+	run(t, dir, "", "mkfifo", "untracked-fifo")
+	writeFile(t, dir, "b.txt", "b\n", 0o644)
+	mgit(t, dir, "add", ".") // adds b.txt and skips the FIFO, as git does
+	if got, want := mgit(t, dir, "status", "--short"), git(t, dir, "status", "--porcelain"); got != want {
+		t.Fatalf("untracked FIFO:\nmgit:\n%sgit:\n%s", got, want)
+	}
+
+	// A tracked file replaced by a FIFO is modified, and cannot be added.
+	remove(t, filepath.Join(dir, "tracked"))
+	run(t, dir, "", "mkfifo", "tracked")
+	if got, want := mgit(t, dir, "status", "--short"), git(t, dir, "status", "--porcelain"); got != want {
+		t.Fatalf("tracked FIFO:\nmgit:\n%sgit:\n%s", got, want)
+	}
+	for _, args := range [][]string{{"add", "tracked"}, {"add", "."}} {
+		if msg := mgitFails(t, dir, nil, args...); !strings.Contains(msg, "can only add regular files") {
+			t.Errorf("mgit %s: %s", strings.Join(args, " "), msg)
+		}
+	}
+}
+
 func TestCommandsWorkFromASubfolder(t *testing.T) {
 	dir := newRepo(t)
 	writeFile(t, dir, "deep/inside/file.txt", "x\n", 0o644)

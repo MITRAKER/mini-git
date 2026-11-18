@@ -996,6 +996,27 @@ None of these needed an exotic tool. Each was found by making a rule
 explicit (check every error, bound every allocation) and then writing the
 test that holds the code to it.
 
+**What a last review found.** Before this work was merged, one more review
+went over the code, comparing it with Git and feeding it hostile input. It
+found three older problems:
+
+- **A bound on size is not a bound on time.** `mgit add .` waited forever
+  when the working tree held a FIFO (a named pipe, made with `mkfifo`).
+  Opening a FIFO waits until another program opens it for writing, so
+  `internal/bounded` never got to read a byte. Git stores only regular files
+  and symbolic links and skips everything else; mgit now does the same
+  (`repo.IsFileOrLink`) and never opens a special file. Rule 2 asks for an
+  end to every loop, and that includes every wait.
+- **`T`, not `M`.** When a file becomes a symbolic link, or a link becomes a
+  file, Git's status letter is `T`, for type change. mgit said `M`.
+  `index.SameKind` now compares the kind of two modes.
+- **Garbage after the data.** Bytes added to the end of an object file, after
+  the compressed stream, went unnoticed: the object inside was fine and its
+  hash checked out. Git calls such a file corrupt ("garbage at end of loose
+  object"). mgit now does too. Reading from a `bytes.Reader`, zlib stops
+  exactly at the end of its stream, so anything left in the reader is
+  garbage.
+
 **And one in Go itself.** On the very first CI run of this work, the
 govulncheck job failed. Go's vulnerability database lists GO-2026-4602, a
 bug in the `os` package of Go 1.26.0 ("FileInfo can escape from a Root"), and

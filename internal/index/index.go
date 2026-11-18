@@ -53,6 +53,15 @@ type Entry struct {
 	Path                string // repository path with forward slashes
 }
 
+// typeMask selects the kind of file from a mode: regular file, symbolic link
+// or submodule (the S_IFMT bits of a Unix mode).
+const typeMask uint32 = 0o170000
+
+// SameKind reports whether two modes are the same kind of file. A change of
+// kind, such as a file replaced by a symbolic link, is a "type change" (T);
+// the executable bit alone does not count.
+func SameKind(a, b uint32) bool { return a&typeMask == b&typeMask }
+
 // ModeOf returns the mode Git records for a file.
 func ModeOf(fi os.FileInfo) uint32 {
 	switch {
