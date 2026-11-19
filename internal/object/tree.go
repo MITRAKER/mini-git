@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -24,7 +25,7 @@ const minTreeEntryLen = 1 + 1 + 1 + 1 + 20
 // TreeEntry is one line of a tree object: a name, its mode and the hash of
 // the blob (file) or tree (subdirectory) it points at.
 type TreeEntry struct {
-	Mode string // octal, as stored: "100644", "100755", "120000", "40000", "160000"
+	Mode string // octal: "100644", "100755", "120000", "40000" or "160000" (see canonicalMode)
 	Name string
 	Hash Hash
 }
@@ -70,10 +71,11 @@ func parseTreeEntry(data []byte) (TreeEntry, []byte, error) {
 	if sp < 0 {
 		return e, nil, errors.New("missing space after mode")
 	}
-	e.Mode = string(data[:sp])
-	if !isOctal(e.Mode) {
-		return e, nil, fmt.Errorf("bad mode %q", e.Mode)
+	mode, err := canonicalMode(string(data[:sp]))
+	if err != nil {
+		return e, nil, err
 	}
+	e.Mode = mode
 	data = data[sp+1:]
 
 	nul := bytes.IndexByte(data, 0)
@@ -86,6 +88,33 @@ func parseTreeEntry(data []byte) (TreeEntry, []byte, error) {
 	}
 	copy(e.Hash[:], data[nul+1:nul+1+len(e.Hash)])
 	return e, data[nul+1+len(e.Hash):], nil
+}
+
+// canonicalMode turns a mode read from a tree into one of the five modes
+// Git writes, as Git does whenever it reads a tree. Early versions of Git
+// wrote file modes such as 100664 (writable by the group); Git still reads
+// them, as 100644, or as 100755 when the owner may run the file. A mode that
+// is not a file, a link or a folder counts as a submodule, also as in Git.
+func canonicalMode(text string) (string, error) {
+	if !isOctal(text) {
+		return "", fmt.Errorf("bad mode %q", text)
+	}
+	m, err := strconv.ParseUint(text, 8, 32)
+	if err != nil {
+		return "", fmt.Errorf("bad mode %q", text)
+	}
+	switch m & 0o170000 { // the kind of entry
+	case 0o100000:
+		if m&0o100 != 0 {
+			return ModeExecutable, nil
+		}
+		return ModeFile, nil
+	case 0o120000:
+		return ModeSymlink, nil
+	case 0o040000:
+		return ModeDir, nil
+	}
+	return ModeSubmodule, nil
 }
 
 func isOctal(s string) bool {

@@ -89,6 +89,24 @@ func TestParseTree(t *testing.T) {
 	}
 }
 
+// Old versions of Git wrote modes such as 100664 or a zero-padded 040000.
+// Git reads them as one of the five modes it writes today, and so does mgit.
+func TestParseTreeReadsOldModesLikeGit(t *testing.T) {
+	h := Compute(Blob, []byte("x"))
+	for stored, want := range map[string]string{
+		"100644": ModeFile, "100664": ModeFile, "100600": ModeFile, "100640": ModeFile, "100000": ModeFile,
+		"100755": ModeExecutable, "100777": ModeExecutable, "100744": ModeExecutable,
+		"120000": ModeSymlink, "120777": ModeSymlink,
+		"40000": ModeDir, "040000": ModeDir, "40755": ModeDir,
+		"160000": ModeSubmodule, "20000": ModeSubmodule, "0": ModeSubmodule,
+	} {
+		entries, err := ParseTree(append([]byte(stored+" a\x00"), h[:]...))
+		if err != nil || entries[0].Mode != want {
+			t.Errorf("mode %s: got %+v, %v; want %s", stored, entries, err, want)
+		}
+	}
+}
+
 // writeRaw stores compressed bytes as the object file for h, as a corrupt
 // or hostile repository could.
 func writeRaw(t *testing.T, s *Store, h Hash, raw string) {
