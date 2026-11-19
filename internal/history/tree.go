@@ -177,6 +177,16 @@ func readTree(store *object.Store, h object.Hash) ([]object.TreeEntry, error) {
 	return object.ParseTree(data)
 }
 
+// CommitFiles returns every file in a commit, by path: FlattenTree of its
+// tree.
+func CommitFiles(store *object.Store, commit object.Hash) (map[string]File, error) {
+	c, err := ReadCommit(store, commit)
+	if err != nil {
+		return nil, err
+	}
+	return FlattenTree(store, c.Tree)
+}
+
 // ReadCommit loads and decodes a commit object.
 func ReadCommit(store *object.Store, h object.Hash) (*object.CommitData, error) {
 	typ, data, err := store.Read(h)

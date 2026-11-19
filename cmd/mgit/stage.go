@@ -182,7 +182,7 @@ func runStatus(args []string, out *output) error {
 	if *short {
 		printShortStatus(out, res)
 	} else {
-		printLongStatus(out, res)
+		printLongStatus(r, out, res)
 	}
 	return nil
 }
@@ -211,11 +211,11 @@ func label(code byte) string {
 	return ""
 }
 
-func printLongStatus(out *output, res *status.Result) {
+func printLongStatus(r *repo.Repo, out *output, res *status.Result) {
 	if res.Head.Branch != "" {
 		out.printf("On branch %s\n", res.Head.Branch)
 	} else {
-		out.printf("HEAD detached at %s\n", res.Head.Commit.String()[:7])
+		out.printf("HEAD detached at %s\n", r.Objects.Abbrev(res.Head.Commit, 7))
 	}
 	if !res.Head.HasCommit {
 		out.printf("\nNo commits yet\n")

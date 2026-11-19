@@ -127,6 +127,27 @@ func resolveRefName(r *repo.Repo, name string) (object.Hash, bool, error) {
 	return object.Hash{}, false, nil
 }
 
+// RefMatches returns how many refs a name stands for, by the rules of
+// refCandidates: "x" is both the tag refs/tags/x and the branch
+// refs/heads/x when both exist. Git refuses to start a new branch at such
+// a name, because it cannot tell which one you meant.
+func RefMatches(r *repo.Repo, name string) (int, error) {
+	n := 0
+	for _, ref := range refCandidates(name) {
+		if repo.CheckRefName(ref) != nil {
+			continue
+		}
+		_, ok, err := r.ResolveRef(ref)
+		if err != nil {
+			return n, err
+		}
+		if ok {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func isHex(s string) bool {
 	for _, c := range s {
 		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
@@ -255,10 +276,22 @@ func Peel(r *repo.Repo, h object.Hash, want object.Type) (object.Hash, error) {
 		case t == object.Commit && want == object.Tree:
 			return commitTree(data)
 		default:
-			return h, fmt.Errorf("%s is a %s, not a %s", h, t, want)
+			return h, &WrongTypeError{Hash: h, Got: t, Want: want}
 		}
 	}
 	return h, fmt.Errorf("more than %d tags in a row", maxTagChain)
+}
+
+// WrongTypeError is the error Peel returns when a name leads to another type
+// of object than the one wanted, such as a tag of a tree where a commit is
+// needed.
+type WrongTypeError struct {
+	Hash      object.Hash
+	Got, Want object.Type
+}
+
+func (e *WrongTypeError) Error() string {
+	return fmt.Sprintf("%s is a %s, not a %s", e.Hash, e.Got, e.Want)
 }
 
 // peelTags follows annotated tags until it reaches something else.

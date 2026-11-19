@@ -85,11 +85,7 @@ func headFiles(r *repo.Repo, head repo.Head) (map[string]history.File, error) {
 	if !head.HasCommit {
 		return map[string]history.File{}, nil
 	}
-	commit, err := history.ReadCommit(r.Objects, head.Commit)
-	if err != nil {
-		return nil, err
-	}
-	return history.FlattenTree(r.Objects, commit.Tree)
+	return history.CommitFiles(r.Objects, head.Commit)
 }
 
 // changeSet collects one Change per path.
@@ -141,29 +137,47 @@ func (s changeSet) compareIndexToWorktree(r *repo.Repo, ix *index.Index) error {
 
 // worktreeChange compares one index entry with the file on disk.
 func worktreeChange(r *repo.Repo, e *index.Entry) (byte, error) {
-	fi, found, err := r.StatTracked(e.Path)
+	w, err := ReadWorktree(r, e)
 	switch {
 	case err != nil:
 		return Unchanged, err
-	case !found:
+	case !w.Exists:
 		return Deleted, nil
-	case e.StatMatches(fi):
-		return Unchanged, nil // fast path: same size and timestamps
-	case !index.SameKind(index.ModeOf(fi), e.Mode):
+	case !index.SameKind(w.Mode, e.Mode):
 		return TypeChanged, nil
-	case index.ModeOf(fi) != e.Mode:
-		return Modified, nil
-	case !repo.IsFileOrLink(fi.Mode()):
-		return Modified, nil // a FIFO or other special file: never open it
-	}
-	content, err := repo.ReadWorktreeFile(r.AbsPath(e.Path), fi)
-	if err != nil {
-		return Unchanged, err
-	}
-	if object.Compute(object.Blob, content) != e.Hash {
+	case w.Mode != e.Mode || w.Hash != e.Hash:
 		return Modified, nil
 	}
 	return Unchanged, nil
+}
+
+// Worktree is what the working tree holds at a tracked path.
+type Worktree struct {
+	Exists bool
+	Mode   uint32      // the mode Git would record for the file
+	Hash   object.Hash // the blob hash of its contents; zero for a special file
+}
+
+// ReadWorktree looks at the file on disk for the index entry e. When the
+// file has the size and modification time the entry recorded, it is taken
+// to be unchanged and is not read (the fast path that makes status quick);
+// otherwise it is read and hashed. A FIFO or other special file is never
+// opened: opening a FIFO waits for a writer.
+func ReadWorktree(r *repo.Repo, e *index.Entry) (Worktree, error) {
+	fi, found, err := r.StatTracked(e.Path)
+	switch {
+	case err != nil || !found:
+		return Worktree{}, err
+	case e.StatMatches(fi):
+		return Worktree{Exists: true, Mode: e.Mode, Hash: e.Hash}, nil
+	case !repo.IsFileOrLink(fi.Mode()):
+		return Worktree{Exists: true, Mode: index.ModeOf(fi)}, nil
+	}
+	content, err := repo.ReadWorktreeFile(r.AbsPath(e.Path), fi)
+	if err != nil {
+		return Worktree{}, err
+	}
+	return Worktree{Exists: true, Mode: index.ModeOf(fi), Hash: object.Compute(object.Blob, content)}, nil
 }
 
 // sorted returns the changes in path order.

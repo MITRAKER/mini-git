@@ -1,12 +1,12 @@
 package repo
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/MITRAKER/mini-git/internal/bounded"
 	"github.com/MITRAKER/mini-git/internal/lockfile"
@@ -75,37 +75,55 @@ func (r *Repo) HeadTarget() (string, error) {
 // HEAD), which is followed. Git may also keep many refs in one file,
 // .git/packed-refs, so that is checked when there is no separate file.
 func (r *Repo) ResolveRef(ref string) (object.Hash, bool, error) {
+	if err := CheckRefName(ref); err != nil {
+		return object.Hash{}, false, err
+	}
+	name := ref
 	for range maxSymrefDepth {
-		if err := CheckRefName(ref); err != nil {
-			return object.Hash{}, false, err
-		}
-		content, found, err := r.readRefFile(ref)
+		content, found, err := r.readRefFile(name)
 		if err != nil {
 			return object.Hash{}, false, err
 		}
 		if !found {
-			return r.packedRef(ref)
+			return r.packedRef(name)
 		}
 		if next, ok := strings.CutPrefix(content, "ref: "); ok {
-			ref = next
+			if err = CheckRefName(next); err != nil {
+				return object.Hash{}, false, &BrokenRefError{Ref: name, Err: err}
+			}
+			name = next
 			continue
 		}
 		h, err := object.ParseHash(content)
 		if err != nil {
-			return h, false, fmt.Errorf("ref %s is corrupt: %w", ref, err)
+			return h, false, &BrokenRefError{Ref: name, Err: err}
 		}
 		return h, true, nil
 	}
-	return object.Hash{}, false, fmt.Errorf("ref %s: more than %d levels of symbolic refs", ref, maxSymrefDepth)
+	return object.Hash{}, false, &BrokenRefError{Ref: ref, Err: fmt.Errorf("more than %d levels of symbolic refs", maxSymrefDepth)}
 }
 
+// BrokenRefError is the error for a ref file that holds nothing usable:
+// neither a hash nor "ref: <name>" with a valid name, or symbolic refs that
+// point to each other in a loop. Git calls such refs broken, and skips them
+// when it lists refs (see ListRefs).
+type BrokenRefError struct {
+	Ref string // the ref whose file is broken
+	Err error  // what is wrong with it
+}
+
+func (e *BrokenRefError) Error() string { return fmt.Sprintf("ref %s is corrupt: %v", e.Ref, e.Err) }
+
+func (e *BrokenRefError) Unwrap() error { return e.Err }
+
 // readRefFile returns the trimmed contents of a loose ref file. A missing
-// file, or a folder with that name (refs/heads/a when only refs/heads/a/b
-// exists), means the ref is not stored as a file.
+// file, a folder with that name (refs/heads/a when only refs/heads/a/b
+// exists) or a file in place of a folder (refs/heads/a/b when refs/heads/a
+// is a branch) means the ref is not stored as a file.
 func (r *Repo) readRefFile(ref string) (string, bool, error) {
 	p := filepath.Join(r.GitDir, filepath.FromSlash(ref))
 	fi, err := os.Stat(p)
-	if errors.Is(err, os.ErrNotExist) || (err == nil && fi.IsDir()) {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || (err == nil && fi.IsDir()) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -118,27 +136,16 @@ func (r *Repo) readRefFile(ref string) (string, bool, error) {
 	return strings.TrimSpace(string(raw)), true, nil
 }
 
-// packedRef looks a ref up in .git/packed-refs, whose lines are
-// "<hash> <refname>". Lines starting with '#' are comments and lines starting
-// with '^' give the commit an annotated tag points to.
+// packedRef looks a ref up in .git/packed-refs (see readPackedRefs).
 func (r *Repo) packedRef(ref string) (object.Hash, bool, error) {
-	data, err := bounded.ReadFile(filepath.Join(r.GitDir, "packed-refs"), object.MaxSize)
-	if errors.Is(err, os.ErrNotExist) {
-		return object.Hash{}, false, nil
-	}
+	refs, err := r.readPackedRefs()
 	if err != nil {
 		return object.Hash{}, false, err
 	}
-	for _, line := range bytes.Split(data, []byte("\n")) {
-		hx, name, ok := strings.Cut(strings.TrimSpace(string(line)), " ")
-		if !ok || name != ref {
-			continue
+	for _, p := range refs {
+		if p.Name == ref {
+			return p.Hash, true, nil
 		}
-		h, err := object.ParseHash(hx)
-		if err != nil {
-			return h, false, fmt.Errorf("packed-refs is corrupt at %s: %w", ref, err)
-		}
-		return h, true, nil
 	}
 	return object.Hash{}, false, nil
 }
@@ -160,12 +167,38 @@ func (r *Repo) UpdateRef(ref string, newHash, oldHash object.Hash, oldExists boo
 		err = fmt.Errorf("cannot update %s: it changed while this command was running", ref)
 	}
 	if err == nil {
+		err = r.clearRefSpot(ref)
+	}
+	if err == nil {
 		err = lock.Write([]byte(newHash.String() + "\n"))
 	}
 	if err != nil {
 		return errors.Join(err, lock.Rollback())
 	}
 	return lock.Commit()
+}
+
+// clearRefSpot removes a folder that has the ref's name but holds nothing
+// except empty folders, so that the ref's file can take its place. Old
+// versions of Git leave such folders behind when they delete the refs inside
+// them ("refs/heads/a" after deleting "refs/heads/a/b"), and Git removes them
+// the same way. A folder with a file in it stays, and the ref is refused.
+func (r *Repo) clearRefSpot(ref string) error {
+	p := filepath.Join(r.GitDir, filepath.FromSlash(ref))
+	fi, err := os.Lstat(p)
+	switch {
+	case errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
+		return nil
+	case err != nil:
+		return err
+	case !fi.IsDir():
+		return nil // the ref's own file: the lock replaces it
+	}
+	empty, err := RemoveEmptyTree(p)
+	if err == nil && !empty {
+		err = fmt.Errorf("cannot lock ref '%s': there is a non-empty directory '.git/%s' blocking reference '%s'", ref, ref, ref)
+	}
+	return err
 }
 
 // CheckRefName applies Git's rules for ref names (see `git check-ref-format`).

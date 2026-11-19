@@ -132,12 +132,12 @@ func (r *Repo) RelPath(path string) (string, error) {
 
 // StatTracked looks at the working-tree file for a tracked path. found is
 // false when no file is there: it was deleted, a folder now has its name, or
-// one of its parent folders was replaced by a file. Git reports all three as
-// "deleted".
+// one of its parent folders was replaced by a file or by a symbolic link. Git
+// reports all of these as "deleted".
 func (r *Repo) StatTracked(rel string) (os.FileInfo, bool, error) {
-	fi, err := os.Lstat(r.AbsPath(rel))
+	fi, err := r.Lstat(rel)
 	switch {
-	case errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
+	case errors.Is(err, os.ErrNotExist):
 		return nil, false, nil
 	case err != nil:
 		return nil, false, err
@@ -145,6 +145,48 @@ func (r *Repo) StatTracked(rel string) (os.FileInfo, bool, error) {
 		return nil, false, nil
 	}
 	return fi, true, nil
+}
+
+// Lstat describes the repository path rel in the working tree without
+// following any symbolic link: not at rel itself, and not in the folders
+// above it. A path behind a link ("a/b" where "a" is a link) is reported as
+// missing (os.ErrNotExist), because following the link could lead anywhere,
+// even outside the working tree. So is a path below a file ("a/b" where "a"
+// is a file).
+func (r *Repo) Lstat(rel string) (os.FileInfo, error) {
+	abs := r.AbsPath(rel)
+	behind, err := r.behindSymlink(rel)
+	if err != nil {
+		return nil, err
+	}
+	if behind {
+		return nil, &os.PathError{Op: "lstat", Path: abs, Err: os.ErrNotExist}
+	}
+	fi, err := os.Lstat(abs)
+	if errors.Is(err, syscall.ENOTDIR) {
+		return nil, &os.PathError{Op: "lstat", Path: abs, Err: os.ErrNotExist}
+	}
+	return fi, err
+}
+
+// behindSymlink reports whether one of the folders above rel is a symbolic
+// link. It looks at each one with Lstat, which never follows a link.
+func (r *Repo) behindSymlink(rel string) (bool, error) {
+	dir := ""
+	parts := strings.Split(rel, "/")
+	for _, part := range parts[:len(parts)-1] {
+		dir = JoinPath(dir, part)
+		fi, err := os.Lstat(r.AbsPath(dir))
+		switch {
+		case errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
+			return false, nil // missing, so is rel, and Lstat(rel) will say so
+		case err != nil:
+			return false, err
+		case fi.Mode()&os.ModeSymlink != 0:
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // AbsPath converts a repository path back into a path on disk.
