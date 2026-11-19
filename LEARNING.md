@@ -20,6 +20,7 @@ Contents
 - [Lesson 2: The index and `status` (`add`, `status`, `ls-files`)](#lesson-2-the-index-and-status)
 - [Lesson 3: Commits and history (`commit`, `log`, `rev-parse`)](#lesson-3-commits-and-history)
 - [Lesson 4: Professional engineering (CI/CD, linters, NASA/JPL rules)](#lesson-4-professional-engineering)
+- [Lesson 5: Branches and checkout (`branch`, `checkout`)](#lesson-5-branches-and-checkout)
 - [How the code is tested](#how-the-code-is-tested)
 
 ---
@@ -1102,6 +1103,348 @@ mgit cat-file -p ef0101        # corrupt: content is longer than its header says
 
 ---
 
+## Lesson 5: Branches and checkout
+
+Step 4 adds the commands that move between commits:
+
+- `mgit branch` lists the branches, `mgit branch <name> [<start>]` creates
+  one, and `-d` and `-D` delete them.
+- `mgit checkout <branch>` switches to a branch, `mgit checkout <commit>`
+  puts you on that commit without a branch (a "detached HEAD"), and
+  `mgit checkout -b <name> [<start>]` creates a branch and switches to it.
+
+Until now mgit only read your files. `checkout` is the first command that
+**writes and deletes files in your working tree**. That makes it the most
+dangerous command so far, and most of this lesson is about doing it safely.
+
+| Code | What it does |
+|------|--------------|
+| `cmd/mgit/branch.go` | the `branch` command |
+| `cmd/mgit/checkout.go` | the `checkout` command: finds the target, moves HEAD, prints the report |
+| `internal/checkout` | moves the files and the index from one commit to another |
+| `internal/repo/refstore.go` | lists, creates and deletes refs |
+| `internal/index/path.go` | decides which paths may ever be written |
+
+### 5.1 A branch is a file
+
+Lesson 3 showed that a branch is a file holding a commit hash. So making a
+branch is cheap: `mgit branch topic` writes 41 bytes (40 hex digits and a
+newline) to `.git/refs/heads/topic`, through a lock file. Nothing is copied.
+Because a branch name is a path under `.git/refs/heads/`, two rules follow:
+
+- **Names have rules.** `repo.CheckRefName` applies the rules of
+  `git check-ref-format`: no `..`, no `~ ^ : ? * [ \`, no spaces or control
+  characters, no part that starts with `.` or ends in `.lock`, and so on.
+  They keep a name from escaping `.git`, and from looking like revision
+  syntax: `a..b` would read as a range, `a~1` as a parent.
+- **A name cannot be a file and a folder at once.** `feature` and
+  `feature/one` cannot both exist: `refs/heads/feature` would have to be
+  both. `repo.CheckNewRef` refuses with Git's words:
+
+  ```
+  cannot lock ref 'refs/heads/feature/one': 'refs/heads/feature' exists; cannot create 'refs/heads/feature/one'
+  ```
+
+  Deleting `feature/one` leaves the folder `refs/heads/feature` empty, so
+  mgit removes it, and `feature` can be created later. When a new ref must
+  go where an old Git left empty folders behind, they are removed too
+  (`repo.RemoveEmptyTree`); a folder with any file in it stops the new ref.
+
+**Packed refs.** A repository with thousands of tags would have thousands
+of tiny files, so `git pack-refs` (and `git gc`) moves refs into one file,
+`.git/packed-refs`, with one `<hash> <name>` line each. A ref can then be in
+two places, and a loose file wins over a packed line. That is why deleting a
+branch removes **both** copies: deleting only the file would bring the old
+packed value back to life (`repo.DeleteRef`). Rewriting `packed-refs` takes
+its own lock, `packed-refs.lock`, and keeps every other line, including the
+`^<hash>` lines that say which commit an annotated tag points to.
+
+**Odd refs.** A ref file can hold garbage, nothing at all, or the all-zero
+hash. Git calls such a ref *broken*: `git branch` leaves it out and warns
+`warning: ignoring broken ref refs/heads/x`. A *symbolic* ref holds
+`ref: refs/heads/main`, as HEAD does; `git branch` lists it as
+`sym -> main`, and leaves it out without a word when it points to a branch
+that does not exist. mgit does the same: `repo.ListRefs` returns the broken
+names separately, so that the command can warn about them.
+
+### 5.2 Creating and deleting branches
+
+`branch <name> <start>` looks `<start>` up with `internal/revision`, so any
+name from lesson 3 works: `mgit branch fix HEAD~2`. One case needs care. If
+a tag and a branch are both called `x`, the name is **ambiguous**:
+`rev-parse` picks one (in the order of the table in 3.6), but `branch`
+refuses, as Git does, rather than start the new branch from what may be the
+wrong commit:
+
+```
+ambiguous object name: 'x'
+```
+
+Deleting comes in two strengths:
+
+- `-d` deletes a branch only if it is **merged**: its commit must be in
+  HEAD's history (`history.Reachable`). Otherwise the commits that only this
+  branch holds would become unreachable, and Git throws such commits away
+  sooner or later:
+
+  ```
+  the branch 'topic' is not fully merged.
+  If you are sure you want to delete it, run 'mgit branch -D topic'
+  ```
+
+- `-D` deletes it anyway.
+
+Neither deletes the branch you are on. Deleting a symbolic ref deletes the
+link, not the branch it points to: `Deleted branch sym (was refs/heads/main).`
+A branch file that holds garbage cannot be deleted at all, by Git or mgit
+("branch not found"): you delete the file by hand. And naming one branch
+twice, `branch -d x x`, deletes nothing: Git deletes all the names in one
+transaction, and a transaction may not change one ref twice.
+
+### 5.3 Checkout is a two-way merge
+
+Switching from the commit you are on, call it **H**, to another one, **M**,
+sounds simple: delete H's files, write M's. But you may have work in
+progress: edited files, staged changes, new files. Checkout must carry that
+work across when it can, refuse when it cannot, and never lose any of it.
+
+Git calls this a **two-way merge** (`git read-tree -m -u H M`). For each
+path it compares three versions, H's, M's and your index's (**I**), and
+looks at the file on disk. The documentation of `git read-tree` has a table
+of 21 cases. They come down to four rules, which `checkout.decide` applies to
+every path in the index:
+
+1. **H and M agree** (the same version, or neither has the path): keep
+   whatever you have, staged or not (rows 4-5, 14-15). Your changes *come
+   along*. This is why you can switch branches with uncommitted edits, as
+   long as the branches agree on those files.
+2. **Your index already has M's version:** keep it (rows 6-7, 18-19).
+3. **Your index matches H:** if the file on disk matches too, take M's
+   version, or delete the file if M does not have it (rows 10 and 20). If
+   you edited the file, refuse (rows 11 and 21).
+4. **Your index matches neither:** a staged change would be lost, so refuse
+   (rows 8-9, 12-13, 16-17).
+
+Paths that are not in the index (rows 1-3) need their own care. An
+**untracked** file where M has a file would be overwritten, and a folder of
+untracked files there would be deleted with it. Both stop the switch:
+
+```
+error: The following untracked working tree files would be overwritten by checkout:
+	newb
+Please move or remove them before you switch branches.
+Aborting
+```
+
+**Check everything, then change anything.** `checkout.Switch` works in two
+passes. `newPlan` decides what to do with every path and collects every
+problem; it also stops on a broken object (it reads every blob it will
+write) and on a dangerous path (5.4). Only when the plan is clean does
+`apply` touch the disk: first the deletions, so that a file can take the
+place of a folder, then the writes. All along, mgit holds
+`.git/index.lock`, so no other command can change the index meanwhile.
+
+Then `checkout` moves HEAD, and reports:
+
+```
+M	same.txt                    ← standard output: changes that came along
+Switched to branch 'topic'      ← standard error
+```
+
+Three more details, each the same as in Git:
+
+- **`checkout -b new` without a start** leaves the files alone. The new
+  branch starts at the commit you are on, so there is nothing to switch:
+  Git skips the merge, and so does not list your changes either.
+- **An index with a merge conflict** (after a merge that stopped) cannot be
+  switched: `checkout` prints `f: needs merge` for each conflicted file, and
+  refuses.
+- **Leaving a detached HEAD** warns you about commits you would lose. When
+  you commit on a detached HEAD, only HEAD points to the new commits. When
+  HEAD moves away, `history.Lost` finds the ones that no branch or tag can
+  reach:
+
+  ```
+  Warning: you are leaving 1 commit behind, not connected to
+  any of your branches:
+
+    82dad2d Soon lost
+  ```
+
+### 5.4 Never write where you should not
+
+A commit can come from anyone. When you clone a stranger's repository and
+check it out, you write whatever paths its trees name, and a tree is just
+data: `git mktree` will happily make one with a file called `.git` in it.
+Writing that file would replace your repository's own folder: its config
+and its hooks, which are programs Git runs. So `index.CheckPath` refuses
+these paths, as Git's `verify_path` does:
+
+- an empty part, `.` or `..`, which could reach outside the working tree;
+- `.git` in any letter case, because macOS and Windows ignore case;
+- what **Windows** would open as `.git`: `.git.` and `.git ` (Windows drops
+  dots and spaces at the end of a name), `git~1` (its short "8.3" name),
+  `.git::$INDEX_ALLOCATION` (a data stream of the folder), and any of these
+  after a `\`, which Windows reads as a folder separator;
+- what **macOS's HFS+** would open as `.git`: the name with an invisible
+  character inside, such as U+200C ZERO WIDTH NON-JOINER, which HFS+ skips
+  when it compares names;
+- a symbolic link named `.gitmodules`, in any of these spellings. Git reads
+  that file to find submodules; through a link it would read any file on
+  your disk.
+
+These rules come from real attacks on Git. The first, CVE-2014-9390, was
+`.git` spelled for case-insensitive, Windows and macOS file systems; the
+`.gitmodules` rules came with the fixes for CVE-2018-11235, and more Windows
+spellings followed in 2019. Git refuses the Windows spellings on every
+system, so that a repository made on Linux cannot attack a checkout on
+Windows. mgit refuses the HFS+ spellings everywhere too.
+
+The working tree can be hostile as well. If a symbolic link stands where a
+folder should be, writing `d/x` would follow the link and write **outside**
+the repository. So mgit never follows a link in the working tree:
+
+- it looks at each folder above a path with `Lstat`, which reports a link
+  as a link, and refuses anything that is not a real folder (`obstacleAt`,
+  `makeParents`);
+- it creates each file with `O_CREATE|O_EXCL`, which fails if *anything* is
+  already there, a link included, instead of writing through it
+  (`createFile`).
+
+Finally, old versions of Git wrote file modes such as `100664`. Git reads
+every mode as one of the five it writes today (`100644`, `100755`, `120000`,
+`40000` and `160000`), and so does `object.ParseTree` (`canonicalMode`).
+
+### 5.5 When a write fails half-way
+
+The checks make sure that nothing *you* did is in the way. The system can
+still fail: the disk fills up, or a file is too large. By then, some files
+have been switched already. Git carries on: it writes every file it can,
+then writes the index and moves HEAD all the same, so that HEAD, the index
+and the files agree everywhere except in the files that failed. mgit does
+the same (`checkout.UpdateError`). In the last part of **Try it** below:
+
+```
+M	big.bin
+Switched to branch 'big'
+mgit checkout: cannot write big.bin: write /…/branch-demo/big.bin: file too large
+the other files were switched; 'mgit status' shows these as changes
+```
+
+A file that could not be written gets M's hash in the index but no stat
+information, so `status` shows it as modified, and `git checkout -- big.bin`
+writes it again. Nothing is lost: every file that was overwritten or deleted
+matched H, so H still has it. One difference: Git exits with status 0 here,
+mgit with 1, because something did fail.
+
+### 5.6 Where mgit differs from Git, on purpose
+
+The tests compare mgit with Git (5.7), so every difference is a decision:
+
+- **No reflog.** Git logs every move of HEAD in `.git/logs/HEAD`. That is
+  how `git branch` can say `(HEAD detached at v1)`: it remembers that you
+  typed `v1`. mgit keeps no reflog, and names the commit:
+  `(HEAD detached at 2a5cb45)`.
+- **A link where a folder was.** When an untracked symbolic link stands
+  where a tracked folder was, Git looks through it, and if the file is not
+  behind the link, replaces the link with a folder and goes on. mgit never
+  follows a link, so it reports a local change.
+- **Checks before changes.** Git finds some problems only after it has
+  started to change files: a new branch whose name clashes
+  (`checkout -b feature/x b` when `feature` exists), a start that is both a
+  tag and a branch, and a damaged object. It stops with some files switched
+  and HEAD where it was. mgit finds all three before it changes anything.
+- **Every problem listed.** When the new commit has a file where you have a
+  folder, Git stops looking inside the folder at the first problem; mgit
+  lists every problem it finds.
+- **HFS+ names everywhere** (5.4), and **exit status 1** after a failed
+  write (5.5).
+
+### 5.7 Testing against Git, twice
+
+The step-4 tests use a new pattern, **twins** (`e2e/twins_test.go`): build
+the same repository twice, run a command with `git` in one copy and with
+`mgit` in the other, and compare everything: both succeed or both fail, with
+the same standard output and the same paths named in an error, and leave
+the same HEAD, refs, index, status and files behind, down to permissions
+and link targets. `TestCheckoutMatchesGit` runs forty such cases, from "a
+local change comes along" to "untracked files in place of a deleted file".
+
+Where mgit differs on purpose, a test checks mgit alone.
+`TestCheckoutReportsAFileItCouldNotWrite` makes a write really fail, with
+the shell's `ulimit -f` (the largest file a process may write). Go ignores
+the `SIGXFSZ` signal that this sends, so the write returns an error
+instead of killing mgit, and the test checks that HEAD moved and that
+`status` shows the file as modified.
+
+### Try it
+
+```sh
+mkdir branch-demo && cd branch-demo && mgit init
+git config user.name "Your Name" && git config user.email "you@example.com"
+echo one > a.txt && echo same > s.txt && mgit add . && mgit commit -m "First"
+
+mgit branch topic                    # 41 bytes, nothing copied
+cat .git/refs/heads/topic
+mgit checkout topic
+echo two > a.txt && mgit commit -a -m "On topic"
+mgit checkout main && cat a.txt      # one
+
+# Your changes come along, or stop you
+echo mine > s.txt && mgit checkout topic    # s.txt is the same on both: M s.txt
+mgit checkout main && git checkout -- s.txt
+echo mine > a.txt && mgit checkout topic    # a.txt differs: refused
+git checkout -- a.txt
+
+# -d refuses to lose commits, -D does not
+mgit branch -d topic
+mgit branch -D topic
+
+# Commits left behind on a detached HEAD
+mgit checkout HEAD~0
+echo three > a.txt && mgit commit -a -m "Soon lost"
+mgit checkout main                   # the warning names the commit
+
+# A dangerous tree: both refuse
+blob=$(mgit hash-object -w a.txt)
+tree=$(printf '100644 blob %s\tGIT~1\n' $blob | git mktree)
+git branch evil $(git commit-tree -m evil $tree)
+mgit checkout evil; git checkout evil
+
+# A write that fails half-way
+mgit checkout -b big
+head -c 4000000 /dev/zero > big.bin && mgit add big.bin && mgit commit -m "A big file"
+mgit checkout main
+(ulimit -f 1000; mgit checkout big)  # files of at most 1000 blocks
+mgit status                          # on branch big; big.bin is modified
+git checkout -- big.bin && mgit status
+```
+
+### Exercises
+
+1. **A reflog.** Make every command that moves HEAD add a line to
+   `.git/logs/HEAD`, in Git's format:
+   `<old hash> <new hash> <name> <<email>> <seconds> <zone>`, a tab, and a
+   message such as `checkout: moving from main to topic`. Check it with
+   `git reflog`, then use it to print `(HEAD detached at v1)` as Git does.
+2. **`checkout -- <file>`.** Add the other half of `checkout`: copy a file
+   from the index back to the working tree, throwing away your edits to it.
+   Which safety rules from 5.4 still apply? Which checks from 5.3 do not, and
+   why does that make this form dangerous?
+3. You stage a file with `git add`, then switch to a branch that has exactly
+   that version. Which row of the table is that? Find the case in
+   `TestCheckoutMatchesGit`, and the line in `checkout.decide` that handles
+   it.
+4. In `createFile`, replace `O_EXCL` with `O_TRUNC`. Which test fails? What
+   could someone who planted a symbolic link in your working tree do then?
+5. Make mgit list problems exactly as Git does (5.6): stop looking inside a
+   folder at the first problem. Which output is more useful?
+6. Harder: add `branch -m <old> <new>` to rename a branch. What must happen
+   to HEAD when you rename the branch you are on? And when `<new>` clashes
+   with another branch, as in 5.1?
+
+---
+
 ## How the code is tested
 
 There are two layers of tests (`go test ./...`, or `make test`):
@@ -1117,7 +1460,10 @@ There are two layers of tests (`go test ./...`, or `make test`):
   `git status --porcelain` prints. `TestCommitsAreByteForByteIdenticalToGit`
   goes furthest: it makes the same commits with Git and with mgit and
   requires **identical commit hashes**, which proves every byte of every blob,
-  tree and commit matches.
+  tree and commit matches. The tests for branches and checkout go one step
+  further with *twins*: the same repository twice, git in one copy and mgit
+  in the other, and both must end up identical
+  ([lesson 5.7](#57-testing-against-git-twice)).
 
 Using an existing, trusted program as the answer key is called *differential
 testing* (or using a "test oracle"). It is how you test a re-implementation:
@@ -1132,5 +1478,5 @@ checks on your machine.
 
 ---
 
-*Next: step 4, branches. `mgit branch` and `mgit checkout`, which finally
-write files back into the working tree.*
+*Next: step 5, `mgit diff`, which shows line by line what changed between
+two versions of a file.*
