@@ -73,18 +73,44 @@ func TestSetReplacesFileDirectoryClashes(t *testing.T) {
 }
 
 func TestCheckPath(t *testing.T) {
-	for _, ok := range []string{"a", "a/b.txt", "dir/.gitignore", "x.git", ".github/ci.yml", "名前"} {
-		if err := CheckPath(ok); err != nil {
+	for _, ok := range []string{"a", "a/b.txt", "dir/.gitignore", "x.git", ".github/ci.yml", "名前",
+		".gitx", "git~10", "git~1x", ".git.bak", "a\\b", ".gitmodules", "gitmod~1"} {
+		if err := CheckPath(ok, ModeFile); err != nil {
 			t.Errorf("CheckPath(%q) = %v", ok, err)
 		}
 	}
 	for _, bad := range []string{"", "/abs", "a/", "a//b", "./a", "a/./b", "../up", "a/../b", ".git", ".GIT/config",
-		"sub/.git/hooks/x", "nul\x00byte", strings.Repeat("a", maxPathLen+1)} {
-		if err := CheckPath(bad); err == nil {
+		"sub/.git/hooks/x", "nul\x00byte", strings.Repeat("a", maxPathLen+1),
+		// What Windows opens as .git: trailing dots and spaces, the 8.3 alias,
+		// a data stream, and a piece after a backslash.
+		".git.", ".git ", ".git. . ", "GIT~1", "git~1/x", ".git::$INDEX_ALLOCATION", "a\\.git", "x\\GIT~1.",
+		// What macOS's HFS+ opens as .git: invisible characters are ignored.
+		".g\u200cit", "\ufeff.GIT", ".git\u200d/x", ".gi\u206at"} {
+		if err := CheckPath(bad, ModeFile); err == nil {
 			t.Errorf("CheckPath(%q) accepted a bad path", bad)
 		}
-		if err := (&Index{}).Set(&Entry{Path: bad}); err == nil {
+		if err := (&Index{}).Set(&Entry{Path: bad, Mode: ModeFile}); err == nil {
 			t.Errorf("Set(%q) accepted a bad path", bad)
+		}
+	}
+}
+
+// A symbolic link may not be named like .gitmodules in any spelling a file
+// system could open as that file, nor sit in a folder named .gitmodules. A
+// regular file may. The lists match what `git update-index` accepts.
+func TestCheckPathRefusesALinkNamedGitmodules(t *testing.T) {
+	for _, name := range []string{".gitmodules", "sub/.GITMODULES", ".gitmodules. ", ".gitmodules:x",
+		"GITMOD~1", "gitmod~4", "gi7eba~1", "gi7eb~12", "gi~12345", ".g\u200citmodules", ".gitmodules/x"} {
+		if err := CheckPath(name, ModeSymlink); err == nil {
+			t.Errorf("a link named %q was accepted", name)
+		}
+		if err := CheckPath(name, ModeFile); err != nil {
+			t.Errorf("a file named %q was refused: %v", name, err)
+		}
+	}
+	for _, name := range []string{".gitmodules./x", "gitmod~1/x", "gitmod~5", "gitmod~1x", "gi7eba~0", "gi7ebb~1", ".gitmodulesx", "gi7eba~1x"} {
+		if err := CheckPath(name, ModeSymlink); err != nil {
+			t.Errorf("a link named %q was refused: %v", name, err)
 		}
 	}
 }

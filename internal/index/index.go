@@ -215,7 +215,7 @@ func parseEntry(b []byte) (*Entry, int, error) {
 		return nil, 0, errors.New("path has no terminator")
 	}
 	e.Path = string(b[nameStart : nameStart+nul])
-	if err := CheckPath(e.Path); err != nil {
+	if err := CheckPath(e.Path, e.Mode); err != nil {
 		return nil, 0, err
 	}
 	size := paddedLen(nameStart + len(e.Path))
@@ -229,41 +229,48 @@ func parseEntry(b []byte) (*Entry, int, error) {
 // least one NUL, which also terminates the path.
 func paddedLen(n int) int { return (n + 8) &^ 7 }
 
-// maxPathLen is the longest path mgit accepts (Linux's PATH_MAX).
-const maxPathLen = 4096
-
-// CheckPath rejects paths that must never be tracked, because writing them
-// to disk later could escape the working tree or overwrite the repository
-// itself: empty paths, absolute paths, "." or ".." parts, empty parts ("a//b"),
-// and any part named ".git" (in any letter case).
-func CheckPath(p string) error {
-	if p == "" || len(p) > maxPathLen {
-		return fmt.Errorf("invalid path %q: empty or longer than %d bytes", p, maxPathLen)
-	}
-	if strings.ContainsRune(p, 0) {
-		return fmt.Errorf("invalid path %q: contains NUL", p)
-	}
-	for _, part := range strings.Split(p, "/") {
-		if part == "" || part == "." || part == ".." || strings.EqualFold(part, ".git") {
-			return fmt.Errorf("invalid path %q: %q is not allowed as a path part", p, part)
-		}
-	}
-	return nil
+// New returns an index holding entries, sorted into index order.
+func New(entries []*Entry) *Index {
+	ix := &Index{Entries: entries}
+	ix.sort()
+	return ix
 }
 
 // Write saves the index to path through a lock file (see package lockfile),
 // so readers never see a half-written index and two commands running at once
 // cannot both write it.
 func (ix *Index) Write(path string) error {
-	data, err := ix.Encode()
-	if err != nil {
-		return err
-	}
 	lock, err := lockfile.Acquire(path)
 	if err != nil {
 		return err
 	}
-	if err := lock.Write(data); err != nil {
+	return ix.CommitLocked(lock)
+}
+
+// ReadLocked takes the index's lock and then reads the index. A command that
+// changes the working tree before it writes the index (such as checkout)
+// holds the lock the whole time, so no other command can change the index
+// in between. Finish with CommitLocked, or with the lock's Rollback.
+func ReadLocked(path string) (*Index, *lockfile.Lock, error) {
+	lock, err := lockfile.Acquire(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	ix, err := Read(path)
+	if err != nil {
+		return nil, nil, errors.Join(err, lock.Rollback())
+	}
+	return ix, lock, nil
+}
+
+// CommitLocked writes the index through a lock taken by ReadLocked (or
+// Write), and releases the lock.
+func (ix *Index) CommitLocked(lock *lockfile.Lock) error {
+	data, err := ix.Encode()
+	if err == nil {
+		err = lock.Write(data)
+	}
+	if err != nil {
 		return errors.Join(err, lock.Rollback())
 	}
 	return lock.Commit()
@@ -279,7 +286,7 @@ func (ix *Index) Encode() ([]byte, error) {
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(ix.Entries))) //nolint:gosec // G115: bounded by memory, far below 2^32 entries
 
 	for i, e := range ix.Entries {
-		if err := CheckPath(e.Path); err != nil {
+		if err := CheckPath(e.Path, e.Mode); err != nil {
 			return nil, err
 		}
 		if e.Stage > maxStage {
@@ -354,7 +361,7 @@ func (ix *Index) Get(path string) *Entry {
 // drops entries that would clash with the new one: a file "a" cannot be
 // tracked next to files inside a directory "a/".
 func (ix *Index) Set(e *Entry) error {
-	if err := CheckPath(e.Path); err != nil {
+	if err := CheckPath(e.Path, e.Mode); err != nil {
 		return err
 	}
 	ix.RemoveUnder(e.Path + "/")
