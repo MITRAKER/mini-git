@@ -1,0 +1,50 @@
+name: Feature request
+description: Ask for a git command, flag or behavior that mgit does not have yet.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the idea! mgit grows one build step at a time. The Status
+        table in the [README](https://github.com/MITRAKER/mini-git#status) shows
+        what is done and what is planned next, so please check it and the
+        existing issues first.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: Which git command or behavior?
+      description: Name the git command and its flags, and describe what mgit should do.
+      placeholder: "For example: `mgit branch -d <name>` should delete a branch, like `git branch -d` does."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: What would you use it for? What can you not do today without it?
+    validations:
+      required: true
+
+  - type: input
+    id: docs
+    attributes:
+      label: Git documentation
+      description: A link to the git documentation for this command or behavior, if there is one.
+      placeholder: https://git-scm.com/docs/git-branch
+
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you like to implement it?
+      description: >-
+        Help is welcome, and
+        [CONTRIBUTING.md](https://github.com/MITRAKER/mini-git/blob/main/CONTRIBUTING.md)
+        explains how to get started.
+      options:
+        - Yes, I would like to send a pull request
+        - Yes, with some guidance
+        - No, I am only suggesting it
+    validations:
+      required: true

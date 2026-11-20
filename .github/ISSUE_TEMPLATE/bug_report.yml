@@ -1,0 +1,97 @@
+name: Bug report
+description: mgit does something wrong, or something different from real git.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug!
+
+        mgit tries to behave exactly like real git, so the most useful report
+        shows the same commands run with both tools. Please do **not** report
+        security problems here: follow the
+        [security policy](https://github.com/MITRAKER/mini-git/security/policy) instead.
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Existing issues
+      options:
+        - label: I searched the existing issues, and this bug is not reported yet.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem in a few sentences. Paste any error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Commands to reproduce
+      description: >-
+        The exact commands, in order. Start from an empty folder if you can,
+        so anyone can paste them into a terminal and see the bug.
+      placeholder: |
+        mkdir demo && cd demo
+        mgit init
+        echo hello > hello.txt
+        mgit add hello.txt
+        mgit status --short
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: >-
+        What did you expect to happen? Ideally, run the same commands with real
+        git (replace `mgit` with `git`) and paste what git prints.
+    validations:
+      required: true
+
+  - type: input
+    id: mgit-version
+    attributes:
+      label: mgit version
+      description: >-
+        The output of `mgit version`. If you built mgit yourself, also give the
+        commit you built from (`git rev-parse --short HEAD` in your mini-git folder).
+    validations:
+      required: true
+
+  - type: input
+    id: git-version
+    attributes:
+      label: git version
+      description: The output of `git --version`.
+      placeholder: git version 2.47.1
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: The output of `go version`. Only needed if you built mgit from source.
+      placeholder: go version go1.26.0 linux/amd64
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: The name and version of your operating system.
+      placeholder: Ubuntu 24.04, macOS 15, or Windows 11 with WSL
+    validations:
+      required: true
+
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else?
+      description: Logs, links, or anything else that helps. Please paste text rather than screenshots.

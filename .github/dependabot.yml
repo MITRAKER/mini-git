@@ -1,0 +1,33 @@
+# Dependabot keeps our dependencies up to date. Once a week it opens at most
+# one pull request per ecosystem, with all available updates grouped together.
+#
+# Security updates are not grouped: when "Dependabot security updates" is on
+# in the repository settings, each one arrives as its own pull request, so it
+# can be reviewed and merged quickly.
+#
+# Options: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+updates:
+  # Go modules listed in go.mod.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-modules:
+        patterns: ["*"]
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build(deps)"
+
+  # Actions used by the workflows in .github/workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "ci(deps)"

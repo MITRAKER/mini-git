@@ -1,0 +1,10 @@
+# Settings for the "New issue" page. Blank issues are turned off, so every
+# issue uses one of the forms in this folder.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/MITRAKER/mini-git/security/advisories/new
+    about: Please report security problems privately here, never in a public issue.
+  - name: Learn how mgit works
+    url: https://github.com/MITRAKER/mini-git/blob/main/LEARNING.md
+    about: Questions about Git internals or the design of mgit? Start with LEARNING.md, one lesson per build step.
