@@ -34,6 +34,7 @@ func runAdd(args []string) error {
 			return err
 		}
 	}
+	status.CheckRacy(r, ix)
 	return ix.Write(r.IndexPath())
 }
 

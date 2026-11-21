@@ -36,6 +36,12 @@ func TestCheckoutMatchesGit(t *testing.T) {
 			git(t, dir, args...)
 		}
 	}
+	chmodStep := func(name string, perm os.FileMode) step {
+		return func(t *testing.T, dir string) {
+			t.Helper()
+			chmod(t, filepath.Join(dir, name), perm)
+		}
+	}
 	// conflict changes f on main too, then merges b, which stops with f
 	// unmerged in the index.
 	conflict := func(t *testing.T, dir string) {
@@ -55,6 +61,10 @@ func TestCheckoutMatchesGit(t *testing.T) {
 		{"already on the branch", nil, []string{"checkout", "main"}},
 		{"a local change blocks", []step{edit("f", "mine\n")}, []string{"checkout", "b"}},
 		{"a local change comes along", []step{edit("same", "mine\n")}, []string{"checkout", "b"}},
+		{"an edit with the old time put back", []step{editKeepingTime("f", "f on MAIN\n")}, []string{"checkout", "b"}},
+		{"an edit with the old time put back, of a file the branch deletes", []step{editKeepingTime("gone", "only on MAIN\n")}, []string{"checkout", "b"}},
+		{"a file only others may run", []step{chmodStep("same", 0o645)}, []string{"checkout", "b"}},
+		{"a changed file only others may run", []step{chmodStep("f", 0o645)}, []string{"checkout", "b"}},
 		{"untracked file in the way", []step{edit("newb", "mine\n")}, []string{"checkout", "b"}},
 		{"untracked file with the same content", []step{edit("newb", "only on b\n")}, []string{"checkout", "b"}},
 		{"untracked file the branch deletes", []step{gitStep("rm", "-q", "--cached", "gone")}, []string{"checkout", "b"}},
@@ -70,6 +80,10 @@ func TestCheckoutMatchesGit(t *testing.T) {
 		}, []string{"checkout", "b"}},
 		{"several problems at once", []step{edit("f", "mine\n"), edit("newb", "mine\n")}, []string{"checkout", "b"}},
 		{"unmerged index", []step{conflict}, []string{"checkout", "c"}},
+		{"no index and no files (clone --no-checkout)", []step{del(".git/index"), del("f"), del("same"), del("d"), del("gone")}, []string{"checkout", "main"}},
+		{"no index and no files, to another branch", []step{del(".git/index"), del("f"), del("same"), del("d"), del("gone")}, []string{"checkout", "b"}},
+		{"no index, but the files are there", []step{del(".git/index")}, []string{"checkout", "b"}},
+		{"an empty index", []step{gitStep("rm", "-q", "-r", "--cached", "."), del("f"), del("same"), del("d"), del("gone")}, []string{"checkout", "b"}},
 
 		// Files and folders in each other's places.
 		{"folder becomes a file", nil, []string{"checkout", "c"}},
@@ -112,6 +126,79 @@ func TestCheckoutMatchesGit(t *testing.T) {
 			}
 			w.run(c.args...)
 		})
+	}
+}
+
+// editKeepingTime returns a step that changes a file without changing its
+// size, then puts its old modification time back. Only the ctime, which
+// nobody can set back, still shows the edit.
+func editKeepingTime(name, content string) func(t *testing.T, dir string) {
+	return func(t *testing.T, dir string) {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(content)) != fi.Size() {
+			t.Fatalf("%q does not have the size of %s", content, name)
+		}
+		writeFile(t, dir, name, content, 0o644)
+		if err := os.Chtimes(p, fi.ModTime(), fi.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Like git, checkout does not remove the folder you run it from: it refuses
+// to put a file in its place, and keeps it when it becomes empty. Only that
+// exact folder is kept, not the folders above it.
+func TestCheckoutKeepsTheCurrentFolder(t *testing.T) {
+	noD := func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "checkout", "-q", "-b", "nod", "main")
+		git(t, dir, "rm", "-q", "-r", "d")
+		git(t, dir, "commit", "-q", "-m", "no d")
+		git(t, dir, "checkout", "-q", "main")
+	}
+	cases := []struct {
+		name, cwd string
+		setup     func(t *testing.T, dir string)
+		args      []string
+	}{
+		{"a file takes its place", "d", nil, []string{"checkout", "c"}},
+		{"it becomes empty", "d", nil, []string{"checkout", "nod"}},
+		{"an empty untracked folder where a file goes", "newb", func(t *testing.T, dir string) {
+			t.Helper()
+			mkdir(t, filepath.Join(dir, "newb"))
+		}, []string{"checkout", "b"}},
+		{"a local change inside", "d", editKeepingTime("d/x", "x on MAIN\n"), []string{"checkout", "c"}},
+		{"an untracked file inside", "d", func(t *testing.T, dir string) {
+			t.Helper()
+			writeFile(t, dir, "d/u", "mine\n", 0o644)
+		}, []string{"checkout", "c"}},
+		{"the folder above is not kept", "d/sub", func(t *testing.T, dir string) {
+			t.Helper()
+			mkdir(t, filepath.Join(dir, "d", "sub"))
+		}, []string{"checkout", "c"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := newTwins(t, noD)
+			if c.setup != nil {
+				w.both(func(dir string) { c.setup(t, dir) })
+			}
+			w.runIn(c.cwd, c.args...)
+		})
+	}
+}
+
+// status must see such an edit too.
+func TestStatusSeesAnEditWithTheOldTime(t *testing.T) {
+	w := newTwins(t, func(dir string) { fixture(t, dir) })
+	w.both(func(dir string) { editKeepingTime("f", "f on MAIN\n")(t, dir) })
+	if res := w.run("status", "--short"); res.stdout != " M f\n" {
+		t.Errorf("status printed %q", res.stdout)
 	}
 }
 
@@ -264,8 +351,10 @@ func TestCheckoutRespectsTheIndexLock(t *testing.T) {
 // Some problems mgit finds before it changes anything, where git finds them
 // only after it has switched the files, and stops with the switch half
 // done: a new branch whose name clashes with another branch, a start that
-// names both a tag and a branch, and a file whose object is damaged. mgit
-// refuses, and nothing changes.
+// names both a tag and a branch, and a file whose object is damaged. And
+// where git throws staged work away without a word (a staged file in a
+// folder that the new commit makes a file), mgit refuses too. Nothing
+// changes.
 func TestCheckoutRefusesBeforeTouchingFiles(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -289,6 +378,18 @@ func TestCheckoutRefusesBeforeTouchingFiles(t *testing.T) {
 			chmod(t, filepath.Join(dir, filepath.FromSlash(name)), 0o644) // objects are read-only
 			writeFile(t, dir, name, "not zlib data", 0o444)
 		}, []string{"checkout", "b"}, "cannot check out newb"},
+		// git drops staged work in a folder that the new commit makes a
+		// file: the staged file goes from the index and from the disk.
+		{"staged file in a folder that becomes a file", func(t *testing.T, dir string) {
+			t.Helper()
+			writeFile(t, dir, "d/new", "staged work\n", 0o644)
+			git(t, dir, "add", "d/new")
+		}, []string{"checkout", "c"}, "\td/new\n"},
+		{"staged change in a folder that becomes a file", func(t *testing.T, dir string) {
+			t.Helper()
+			writeFile(t, dir, "d/x", "staged work\n", 0o644)
+			git(t, dir, "add", "d/x")
+		}, []string{"checkout", "c"}, "\td/x\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

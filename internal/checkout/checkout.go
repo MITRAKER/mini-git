@@ -42,6 +42,7 @@ const (
 type ConflictError struct {
 	Changed   []string // files whose local changes would be overwritten or deleted
 	Dirs      []string // folders whose untracked files would be lost
+	Cwd       []string // the folder mgit runs in, which would be removed (see checkCwd)
 	Untracked []string // untracked files that would be overwritten
 	Removed   []string // untracked files that would be removed (see checkUntrackedRemoved)
 }
@@ -52,6 +53,7 @@ func (c *ConflictError) Error() string {
 	writeList(&b, c.Changed, "Your local changes to the following files would be overwritten by checkout:",
 		"Please commit your changes before you switch branches.")
 	writeList(&b, c.Dirs, "Updating the following directories would lose untracked files in them:", "")
+	writeList(&b, c.Cwd, "Refusing to remove the current working directory:", "")
 	writeList(&b, c.Untracked, "The following untracked working tree files would be overwritten by checkout:",
 		"Please move or remove them before you switch branches.")
 	writeList(&b, c.Removed, "The following untracked working tree files would be removed by checkout:",
@@ -72,12 +74,12 @@ func writeList(b *strings.Builder, paths []string, title, advice string) {
 }
 
 func (c *ConflictError) empty() bool {
-	return len(c.Changed)+len(c.Dirs)+len(c.Untracked)+len(c.Removed) == 0
+	return len(c.Changed)+len(c.Dirs)+len(c.Cwd)+len(c.Untracked)+len(c.Removed) == 0
 }
 
 // tidy sorts each list and drops repeated paths.
 func (c *ConflictError) tidy() {
-	c.Changed, c.Dirs = sortedUnique(c.Changed), sortedUnique(c.Dirs)
+	c.Changed, c.Dirs, c.Cwd = sortedUnique(c.Changed), sortedUnique(c.Dirs), sortedUnique(c.Cwd)
 	c.Untracked, c.Removed = sortedUnique(c.Untracked), sortedUnique(c.Removed)
 }
 
@@ -105,6 +107,7 @@ type plan struct {
 	r        *repo.Repo
 	ix       *index.Index
 	from, to map[string]history.File
+	cwd      string // the folder mgit runs in, as a repository path; "" for the top
 	actions  map[string]action
 	conflict ConflictError
 }
@@ -112,14 +115,16 @@ type plan struct {
 // Switch moves the working tree and the index from the commit whose files
 // are from (empty before the first commit) to the commit whose files are
 // to, and returns the new index for the caller to write. Nobody else may
-// change the index meanwhile: hold its lock (index.ReadLocked).
+// change the index meanwhile: hold its lock (index.ReadLocked). cwd is the
+// folder mgit runs in, as a repository path ("" for the top of the working
+// tree): like Git, Switch never removes it.
 //
 // If local work is in the way, it returns a *ConflictError and changes
 // nothing; so it does for any other problem found before the first change,
 // such as a broken object or a path that must not be written. A failure
 // while files are being changed is different: see apply.
-func Switch(r *repo.Repo, ix *index.Index, from, to map[string]history.File) (*index.Index, error) {
-	p, err := newPlan(r, ix, from, to)
+func Switch(r *repo.Repo, ix *index.Index, from, to map[string]history.File, cwd string) (*index.Index, error) {
+	p, err := newPlan(r, ix, from, to, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +132,7 @@ func Switch(r *repo.Repo, ix *index.Index, from, to map[string]history.File) (*i
 }
 
 // newPlan decides what to do with every path, and checks that it is safe.
-func newPlan(r *repo.Repo, ix *index.Index, from, to map[string]history.File) (*plan, error) {
+func newPlan(r *repo.Repo, ix *index.Index, from, to map[string]history.File, cwd string) (*plan, error) {
 	if err := checkTarget(to); err != nil {
 		return nil, err
 	}
@@ -140,7 +145,7 @@ func newPlan(r *repo.Repo, ix *index.Index, from, to map[string]history.File) (*
 	if len(unmerged) > 0 {
 		return nil, &UnmergedError{Paths: sortedUnique(unmerged)}
 	}
-	p := &plan{r: r, ix: ix, from: from, to: to, actions: map[string]action{}}
+	p := &plan{r: r, ix: ix, from: from, to: to, cwd: cwd, actions: map[string]action{}}
 	for _, path := range allPaths(from, to, ix) {
 		a, err := p.decide(path)
 		if err != nil {
@@ -201,13 +206,18 @@ func (p *plan) decide(path string) (action, error) {
 }
 
 // decideUntracked handles rows 1 to 3, where the index does not have path.
+//
+// When there is no index at all (index.Index.Unborn), as right after `git
+// clone --no-checkout`, Git does an "initial checkout": nothing was staged,
+// so row 3 does not apply, and every file of the new commit is written like
+// a new file, unless an untracked file is in its way.
 func (p *plan) decideUntracked(path string) (action, error) {
 	old, inOld := p.from[path]
 	nu, inNew := p.to[path]
 	switch {
 	case !inNew:
 		return keep, p.checkUntrackedRemoved(path) // row 2
-	case !inOld:
+	case !inOld || p.ix.Unborn():
 		return write, nil // row 1: a new file (checkWrites looks at what is in its way)
 	case same(old, nu):
 		return keep, nil // row 3: a deletion you staged; the file stays deleted
@@ -228,7 +238,10 @@ func (p *plan) checkUntrackedRemoved(path string) error {
 	case err != nil:
 		return err
 	case fi.IsDir():
-		_, err := p.checkFolder(path)
+		lost, err := p.checkFolder(path)
+		if err == nil && !lost {
+			p.checkCwd(path)
+		}
 		return err
 	}
 	p.conflict.Removed = append(p.conflict.Removed, path)
@@ -238,7 +251,7 @@ func (p *plan) checkUntrackedRemoved(path string) error {
 // decideByWorktree handles rows 10-11 and 20-21: the index matches the old
 // commit, so only the file on disk can hold changes.
 func (p *plan) decideByWorktree(path string, e *index.Entry, inNew bool) (action, error) {
-	w, err := status.ReadWorktree(p.r, e)
+	w, err := status.ReadWorktree(p.r, p.ix, e)
 	switch {
 	case err != nil:
 		return keep, err
@@ -270,9 +283,13 @@ func (p *plan) decideMissing(path string, inNew bool) (action, error) {
 		return remove, nil // row 10: the index entry goes
 	case what == folderThere && !inNew:
 		// Row 10 with a folder at path: Git looks for untracked files in
-		// it first, and names the folder if it finds any.
+		// it first, and names the folder if it finds any. Then it refuses
+		// to remove the folder you are in.
 		if lost, err := p.checkFolder(path); err != nil || lost {
 			return keep, err
+		}
+		if p.checkCwd(path) {
+			return keep, nil
 		}
 	}
 	return p.changed(path), nil
@@ -389,12 +406,39 @@ func (p *plan) checkSpot(path string) error {
 	case err != nil:
 		return err
 	case fi.IsDir():
-		_, err := p.checkFolder(path)
+		lost, err := p.checkFolder(path)
+		if err == nil && !lost && !p.changedUnder(path) {
+			p.checkCwd(path)
+		}
 		return err
 	case p.ix.Get(path) == nil:
 		p.conflict.Untracked = append(p.conflict.Untracked, path)
 	}
 	return nil
+}
+
+// checkCwd is called when the switch must remove the folder at path. If
+// that is the folder mgit runs in, it records the problem and returns true:
+// like Git, mgit does not pull the current directory out from under you.
+// Git looks only at that exact folder, not at the folders above it, and
+// only once nothing else is wrong in the folder.
+func (p *plan) checkCwd(folder string) bool {
+	if p.cwd == "" || folder != p.cwd {
+		return false
+	}
+	p.conflict.Cwd = append(p.conflict.Cwd, folder)
+	return true
+}
+
+// changedUnder reports whether a file inside folder has local changes in
+// the way (they are found before checkWrites runs).
+func (p *plan) changedUnder(folder string) bool {
+	for _, path := range p.conflict.Changed {
+		if strings.HasPrefix(path, folder+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // checkFolder reports a folder that holds an untracked file (or a .git
@@ -428,6 +472,10 @@ func (p *plan) checkFolder(folder string) (bool, error) {
 
 // checkKeptEntries finds index entries that the switch keeps inside a
 // folder that a new file replaces: an index cannot hold both "d" and "d/x".
+// They hold staged work (a new file, or a change the new commit does not
+// have), so mgit refuses. Git does not: it drops them from the index and
+// deletes the files, losing that work. This is one of the places where mgit
+// is deliberately safer than Git (see LEARNING.md, 5.6).
 func (p *plan) checkKeptEntries() {
 	for _, e := range p.ix.Entries {
 		if p.actions[e.Path] != keep {

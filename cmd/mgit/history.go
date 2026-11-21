@@ -102,6 +102,8 @@ func commitIndex(r *repo.Repo, all bool) (*index.Index, error) {
 
 // stageTrackedChanges is `commit -a`: re-add every tracked file that changed
 // and drop every tracked file that was deleted. New files are not added.
+// A racily clean file is re-added too, which compares its contents: after
+// that, no entry is racily clean (see index.Index.Racy).
 func stageTrackedChanges(r *repo.Repo, ix *index.Index) error {
 	var gone []string
 	for _, e := range ix.Entries {
@@ -111,7 +113,7 @@ func stageTrackedChanges(r *repo.Repo, ix *index.Index) error {
 			return err
 		case !found:
 			gone = append(gone, e.Path)
-		case !e.StatMatches(fi):
+		case !ix.UpToDate(e, fi):
 			if err := addFile(r, ix, e.Path, fi); err != nil {
 				return err
 			}

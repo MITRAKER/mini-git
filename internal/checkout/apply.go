@@ -34,7 +34,7 @@ func (p *plan) apply() (*index.Index, error) {
 			failed = append(failed, fmt.Errorf("cannot delete %s: %w", path, err))
 		}
 	}
-	removeEmptyFolders(p.r, removes)
+	removeEmptyFolders(p.r, removes, p.cwd)
 	entries := make([]*index.Entry, 0, len(p.ix.Entries)+len(writes))
 	for _, e := range p.ix.Entries {
 		if p.actions[e.Path] == keep {
@@ -50,10 +50,11 @@ func (p *plan) apply() (*index.Index, error) {
 		}
 		entries = append(entries, e)
 	}
+	newIx := p.ix.Derive(entries) // entries kept from p.ix may be racily clean: see index.Index.Racy
 	if len(failed) > 0 {
-		return index.New(entries), &UpdateError{Failed: failed}
+		return newIx, &UpdateError{Failed: failed}
 	}
-	return index.New(entries), nil
+	return newIx, nil
 }
 
 // UpdateError is returned by Switch, together with the new index, when some
@@ -87,8 +88,9 @@ func removeFile(r *repo.Repo, path string) error {
 
 // removeEmptyFolders removes the folders that deleting files has left
 // empty, deepest first (Git does not track empty folders). A folder that
-// still holds anything stays.
-func removeEmptyFolders(r *repo.Repo, removed []string) {
+// still holds anything stays, and so does cwd, the folder mgit runs in (and
+// so the folders above it).
+func removeEmptyFolders(r *repo.Repo, removed []string, cwd string) {
 	seen := map[string]bool{}
 	for _, path := range removed {
 		for dir := parentDir(path); dir != "" && !seen[dir]; dir = parentDir(dir) {
@@ -103,6 +105,9 @@ func removeEmptyFolders(r *repo.Repo, removed []string) {
 	// reverse order, every folder comes before its parent.
 	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
 	for _, dir := range dirs {
+		if dir == cwd {
+			continue
+		}
 		fi, err := r.Lstat(dir) // never a folder reached through a link
 		if err != nil || !fi.IsDir() {
 			continue
@@ -236,7 +241,7 @@ type Change struct {
 func LocalChanges(r *repo.Repo, ix *index.Index, to map[string]history.File) ([]Change, error) {
 	codes := map[string]byte{}
 	for _, e := range ix.Entries {
-		w, err := status.ReadWorktree(r, e)
+		w, err := status.ReadWorktree(r, ix, e)
 		if err != nil {
 			return nil, err
 		}

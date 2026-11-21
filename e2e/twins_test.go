@@ -75,8 +75,14 @@ func (w *twins) both(step func(dir string)) {
 // returns mgit's result.
 func (w *twins) run(args ...string) cmdResult {
 	w.t.Helper()
-	g := execIn(w.git, nil, "", "git", args...)
-	m := execIn(w.mgit, nil, "", mgitBin, args...)
+	return w.runIn("", args...)
+}
+
+// runIn is run, with both commands started in the folder sub of each copy.
+func (w *twins) runIn(sub string, args ...string) cmdResult {
+	w.t.Helper()
+	g := execIn(filepath.Join(w.git, sub), nil, "", "git", args...)
+	m := execIn(filepath.Join(w.mgit, sub), nil, "", mgitBin, args...)
 	what := strings.Join(args, " ")
 	if (g.err == nil) != (m.err == nil) {
 		w.t.Fatalf("%s: git error %v, mgit error %v\ngit: %smgit: %s", what, g.err, m.err, g.stderr, m.stderr)

@@ -12,6 +12,7 @@ import (
 	"github.com/MITRAKER/mini-git/internal/object"
 	"github.com/MITRAKER/mini-git/internal/repo"
 	"github.com/MITRAKER/mini-git/internal/revision"
+	"github.com/MITRAKER/mini-git/internal/status"
 )
 
 const checkoutUsage = `mgit checkout <branch>                 switch to a branch
@@ -159,7 +160,7 @@ func switchFiles(r *repo.Repo, head repo.Head, commit object.Hash, out *output) 
 	if err != nil {
 		return nil, nil, err
 	}
-	newIx, err := checkout.Switch(r, ix, from, to)
+	newIx, err := checkout.Switch(r, ix, from, to, cwdPath(r))
 	var update *checkout.UpdateError
 	switch {
 	case errors.As(err, &update):
@@ -168,11 +169,27 @@ func switchFiles(r *repo.Repo, head repo.Head, commit object.Hash, out *output) 
 		printUnmerged(err, out)
 		return nil, nil, errors.Join(err, lock.Rollback())
 	}
+	status.CheckRacy(r, newIx)
 	if err = newIx.CommitLocked(lock); err != nil {
 		return nil, nil, errors.Join(problems, err)
 	}
 	changes, err = checkout.LocalChanges(r, newIx, to)
 	return changes, errors.Join(problems, err), nil
+}
+
+// cwdPath returns the folder mgit runs in as a repository path: "" for the
+// top of the working tree, and for a folder outside it (such as .git),
+// which a checkout never removes.
+func cwdPath(r *repo.Repo) string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	rel, err := r.RelPath(wd)
+	if err != nil {
+		return ""
+	}
+	return rel
 }
 
 // printUnmerged lists the paths of an unresolved merge conflict on standard

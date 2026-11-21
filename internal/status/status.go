@@ -124,7 +124,7 @@ func (s changeSet) compareHeadToIndex(committed map[string]history.File, ix *ind
 // compareIndexToWorktree finds edits you have not staged with `add` yet.
 func (s changeSet) compareIndexToWorktree(r *repo.Repo, ix *index.Index) error {
 	for _, e := range ix.Entries {
-		code, err := worktreeChange(r, e)
+		code, err := worktreeChange(r, ix, e)
 		if err != nil {
 			return err
 		}
@@ -136,8 +136,8 @@ func (s changeSet) compareIndexToWorktree(r *repo.Repo, ix *index.Index) error {
 }
 
 // worktreeChange compares one index entry with the file on disk.
-func worktreeChange(r *repo.Repo, e *index.Entry) (byte, error) {
-	w, err := ReadWorktree(r, e)
+func worktreeChange(r *repo.Repo, ix *index.Index, e *index.Entry) (byte, error) {
+	w, err := ReadWorktree(r, ix, e)
 	switch {
 	case err != nil:
 		return Unchanged, err
@@ -158,26 +158,62 @@ type Worktree struct {
 	Hash   object.Hash // the blob hash of its contents; zero for a special file
 }
 
-// ReadWorktree looks at the file on disk for the index entry e. When the
-// file has the size and modification time the entry recorded, it is taken
-// to be unchanged and is not read (the fast path that makes status quick);
-// otherwise it is read and hashed. A FIFO or other special file is never
-// opened: opening a FIFO waits for a writer.
-func ReadWorktree(r *repo.Repo, e *index.Entry) (Worktree, error) {
+// ReadWorktree looks at the file on disk for the entry e of the index ix.
+// When the file's stat information shows that it is unchanged
+// (ix.UpToDate), it is not read: that is the fast path that makes status
+// quick. Otherwise it is read and hashed. A FIFO or other special file is
+// never opened: opening a FIFO waits for a writer.
+func ReadWorktree(r *repo.Repo, ix *index.Index, e *index.Entry) (Worktree, error) {
 	fi, found, err := r.StatTracked(e.Path)
 	switch {
 	case err != nil || !found:
 		return Worktree{}, err
-	case e.StatMatches(fi):
+	case ix.UpToDate(e, fi):
 		return Worktree{Exists: true, Mode: e.Mode, Hash: e.Hash}, nil
-	case !repo.IsFileOrLink(fi.Mode()):
+	}
+	return readFile(r, e.Path, fi)
+}
+
+// readFile hashes the file at path, which fi describes. A special file is
+// reported with no hash: it can never match an entry.
+func readFile(r *repo.Repo, path string, fi os.FileInfo) (Worktree, error) {
+	if !repo.IsFileOrLink(fi.Mode()) {
 		return Worktree{Exists: true, Mode: index.ModeOf(fi)}, nil
 	}
-	content, err := repo.ReadWorktreeFile(r.AbsPath(e.Path), fi)
+	content, err := repo.ReadWorktreeFile(r.AbsPath(path), fi)
 	if err != nil {
 		return Worktree{}, err
 	}
 	return Worktree{Exists: true, Mode: index.ModeOf(fi), Hash: object.Compute(object.Blob, content)}, nil
+}
+
+// CheckRacy runs before a command writes an index that it read from disk.
+// It compares the file of every racily clean entry (see index.Index.Racy)
+// with the entry: a file that changed has its entry smudged, so that the
+// change is still noticed once the new index file is newer than the file;
+// the others are marked as checked. Without this, writing the index
+// smudges every racily clean entry, changed or not (see
+// index.Index.CommitLocked), and later commands must read those files again.
+// A file it cannot read is left to that: smudging is always safe.
+func CheckRacy(r *repo.Repo, ix *index.Index) {
+	for _, e := range ix.Entries {
+		if !ix.Racy(e) {
+			continue
+		}
+		fi, found, err := r.StatTracked(e.Path)
+		if err != nil || !found || !e.StatMatches(fi) {
+			continue // the stat information already tells that it changed, or CommitLocked smudges it
+		}
+		w, err := readFile(r, e.Path, fi)
+		switch {
+		case err != nil:
+			continue
+		case w.Mode == e.Mode && w.Hash == e.Hash:
+			e.MarkChecked()
+		default:
+			e.Smudge()
+		}
+	}
 }
 
 // sorted returns the changes in path order.

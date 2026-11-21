@@ -37,6 +37,7 @@ func TestConflictErrorListsProblemsInGitsOrder(t *testing.T) {
 	c := &ConflictError{
 		Removed:   []string{"r"},
 		Untracked: []string{"u2", "u1", "u2"},
+		Cwd:       []string{"w"},
 		Dirs:      []string{"d"},
 		Changed:   []string{"c"},
 	}
@@ -44,6 +45,7 @@ func TestConflictErrorListsProblemsInGitsOrder(t *testing.T) {
 	want := "Your local changes to the following files would be overwritten by checkout:\n\tc\n" +
 		"Please commit your changes before you switch branches.\n" +
 		"Updating the following directories would lose untracked files in them:\n\td\n\n" +
+		"Refusing to remove the current working directory:\n\tw\n\n" +
 		"The following untracked working tree files would be overwritten by checkout:\n\tu1\n\tu2\n" +
 		"Please move or remove them before you switch branches.\n" +
 		"The following untracked working tree files would be removed by checkout:\n\tr\n" +
@@ -108,7 +110,7 @@ func TestSwitchRefusesThenWrites(t *testing.T) {
 	to := map[string]history.File{"dir/a": {Mode: index.ModeFile, Hash: h}}
 	writeTestFile(t, r.AbsPath("dir/a"), "mine\n")
 
-	_, err = Switch(r, index.New(nil), nil, to)
+	_, err = Switch(r, index.New(nil), nil, to, "")
 	var conflict *ConflictError
 	if !errors.As(err, &conflict) || len(conflict.Untracked) != 1 || conflict.Untracked[0] != "dir/a" {
 		t.Fatalf("Switch = %v, want an untracked file in the way", err)
@@ -120,7 +122,7 @@ func TestSwitchRefusesThenWrites(t *testing.T) {
 	if err = os.Remove(r.AbsPath("dir/a")); err != nil {
 		t.Fatal(err)
 	}
-	ix, err := Switch(r, index.New(nil), nil, to)
+	ix, err := Switch(r, index.New(nil), nil, to, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +147,7 @@ func TestSwitchChecksEveryObjectFirst(t *testing.T) {
 		"a": {Mode: index.ModeFile, Hash: good},
 		"b": {Mode: index.ModeFile, Hash: missing},
 	}
-	_, err = Switch(r, index.New(nil), nil, to)
+	_, err = Switch(r, index.New(nil), nil, to, "")
 	if !errors.Is(err, object.ErrNotFound) || !strings.Contains(err.Error(), "cannot check out b") {
 		t.Fatalf("Switch = %v, want an error about b", err)
 	}
