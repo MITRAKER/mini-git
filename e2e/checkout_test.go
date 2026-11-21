@@ -193,6 +193,40 @@ func TestCheckoutKeepsTheCurrentFolder(t *testing.T) {
 	}
 }
 
+// File names with a quote, a tab or a non-ASCII character are printed in
+// quotes, with C escapes, as git prints them.
+func TestNamesAreQuotedLikeGit(t *testing.T) {
+	names := []string{"é.txt", "a\"b", "tab\tx", `back\slash`, "sp ace"}
+	w := newTwins(t, func(dir string) {
+		git(t, dir, "init", "-q", "-b", "main")
+		for _, n := range names {
+			writeFile(t, dir, n, "one\n", 0o644)
+		}
+		git(t, dir, "add", ".")
+		git(t, dir, "commit", "-q", "-m", "one")
+		git(t, dir, "branch", "other")
+		writeFile(t, dir, "g", "two\n", 0o644)
+		git(t, dir, "add", "g")
+		git(t, dir, "commit", "-q", "-m", "two")
+		for _, n := range names {
+			writeFile(t, dir, n, "one\nmine\n", 0o644)
+		}
+		writeFile(t, dir, "ü/new", "untracked\n", 0o644)
+	})
+	for _, args := range [][]string{
+		{"ls-files"}, {"ls-files", "-s"}, {"cat-file", "-p", "HEAD^{tree}"}, {"status", "--short"},
+		{"checkout", "other"}, // the local changes that come along
+	} {
+		w.run(args...)
+	}
+	long := mgit(t, w.mgit, "status")
+	for _, want := range []string{"\tmodified:   \"\\303\\251.txt\"\n", "\t\"\\303\\274/\"\n"} {
+		if !strings.Contains(long, want) {
+			t.Errorf("status does not print %q:\n%s", want, long)
+		}
+	}
+}
+
 // status must see such an edit too.
 func TestStatusSeesAnEditWithTheOldTime(t *testing.T) {
 	w := newTwins(t, func(dir string) { fixture(t, dir) })

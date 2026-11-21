@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/MITRAKER/mini-git/internal/quote"
 )
 
 // The modes Git writes in trees, as octal text.
@@ -143,11 +145,12 @@ func CheckTreeName(name string) error {
 }
 
 // FormatTree renders a tree the way `git cat-file -p <tree>` does: one line
-// per entry with a 6-digit mode, the type, the hash, a tab and the name.
+// per entry with a 6-digit mode, the type, the hash, a tab and the name,
+// quoted if it needs to be (see package quote).
 func FormatTree(entries []TreeEntry) string {
 	var b strings.Builder
 	for _, e := range entries {
-		fmt.Fprintf(&b, "%06s %s %s\t%s\n", e.Mode, e.Type(), e.Hash, e.Name)
+		fmt.Fprintf(&b, "%06s %s %s\t%s\n", e.Mode, e.Type(), e.Hash, quote.Path(e.Name))
 	}
 	return b.String()
 }

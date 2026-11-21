@@ -10,6 +10,7 @@ import (
 	"github.com/MITRAKER/mini-git/internal/history"
 	"github.com/MITRAKER/mini-git/internal/index"
 	"github.com/MITRAKER/mini-git/internal/object"
+	"github.com/MITRAKER/mini-git/internal/quote"
 	"github.com/MITRAKER/mini-git/internal/repo"
 	"github.com/MITRAKER/mini-git/internal/revision"
 	"github.com/MITRAKER/mini-git/internal/status"
@@ -126,7 +127,7 @@ func switchTo(r *repo.Repo, head repo.Head, t target, out *output) error {
 	// Like git: the local changes that came along go to standard output,
 	// and the messages after them to standard error.
 	for _, c := range changes {
-		out.printf("%c\t%s\n", c.Code, c.Path)
+		out.printf("%c\t%s\n", c.Code, quote.Path(c.Path))
 	}
 	if err := out.flush(); err != nil {
 		return errors.Join(problems, err)
