@@ -1210,6 +1210,17 @@ only as far as it stays unambiguous: a link to `refs/heads/topic` reads
 would mean the tag (`revision.ShortRefName`, after Git's
 `shorten_unambiguous_ref`).
 
+There is an older way to store a symbolic ref: as a **symbolic link**. The
+first versions of Git kept HEAD as a link to the branch file,
+`.git/HEAD -> refs/heads/main`, and `git -c core.preferSymlinkRefs=true
+checkout main` still makes one. Like Git (`read_ref_internal`), mgit reads a
+link whose target is a ref name under `refs/` as `ref: <target>`, even when
+no file is there: a packed branch has none. Any other link is followed like
+a path (`repo.symlinkRef`). Simply reading through the link would be wrong:
+it finds the branch's hash, so HEAD looks detached, a commit cuts HEAD loose
+instead of moving the branch, and `branch -d` deletes the branch you are on.
+When HEAD moves, both write a `ref: ` file in place of the link.
+
 ### 5.2 Creating and deleting branches
 
 `branch <name> <start>` looks `<start>` up with `internal/revision`, so any
@@ -1222,6 +1233,12 @@ wrong commit:
 ```
 ambiguous object name: 'x'
 ```
+
+Without a start, Git does not start from HEAD, but from the current branch
+*by its name*: on `main`, `git branch new` is `git branch new main`. So a tag
+named `main` makes even that ambiguous, and Git refuses, while
+`git branch new HEAD` works. mgit does the same (`startCommit`). With a
+detached HEAD there is no name, and the new branch starts at HEAD's commit.
 
 Deleting comes in two strengths:
 
@@ -1255,7 +1272,12 @@ The obvious one is the branch you are on, but "on" needs care:
   you are on is `main`: Git follows every link (`repo.HeadTarget`).
   `git status` says `On branch main`, a commit moves `main` (writing the new
   hash into `master` would cut the link and make it a branch of its own),
-  and `main` cannot be deleted.
+  and `main` cannot be deleted. The links can even lead out of the
+  branches: `git symbolic-ref HEAD refs/remotes/origin/main` is allowed,
+  and commits then move that remote-tracking ref. With no current branch,
+  every `git branch` command stops with `HEAD not found below refs/heads!`
+  until a checkout puts HEAD back on a branch; so does mgit
+  (`checkHeadOnBranch`).
 - **Other worktrees.** `git worktree add ../hotfix hotfix` checks a branch
   out in a second folder, with its own HEAD and index in
   `.git/worktrees/hotfix/`; the branches are shared. Git marks such a
@@ -1533,6 +1555,14 @@ mgit branch                          # + hotfix
 mgit checkout hotfix                 # refused: it is checked out over there
 mgit branch -D hotfix                # refused too
 git worktree remove ../hotfix
+
+# HEAD as a symbolic link, the old way
+mgit branch linked
+git -c core.preferSymlinkRefs=true checkout linked
+ls -l .git/HEAD                      # HEAD -> refs/heads/linked
+mgit branch                          # * linked: on the branch, not detached
+mgit branch -d linked                # refused: it is the current branch
+mgit checkout main && ls -l .git/HEAD    # a "ref: " file again
 
 # A write that fails half-way
 mgit checkout -b big

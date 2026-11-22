@@ -68,7 +68,16 @@ changes.
     it runs in.
   - HEAD may point to a symbolic branch, such as `master` linked to `main`:
     as in git, the current branch is the one at the end of the links, which
-    a commit moves and which cannot be deleted.
+    a commit moves and which cannot be deleted. When the links lead out of
+    `refs/heads`, `branch` stops with git's `HEAD not found below
+    refs/heads!`.
+  - A HEAD or a branch stored as a symbolic link to a ref name, as old git
+    and `core.preferSymlinkRefs` write it, is read as a symbolic ref, as git
+    reads it. HEAD used to look detached: a commit then left the branch
+    behind, and `branch -d` could delete the current branch.
+  - `branch <new>` with no start point starts from the current branch by
+    name, as git does, so a tag with the same name makes it ambiguous and
+    it is refused.
   - A branch that another worktree has checked out, or that a rebase, a
     bisect or `rebase --update-refs` will come back to, cannot be deleted,
     and checkout refuses a branch checked out in another worktree, as git
