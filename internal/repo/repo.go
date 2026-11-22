@@ -88,14 +88,24 @@ var ErrNotARepo = errors.New("not a git repository (or any of the parent directo
 
 // Find looks for a .git directory in start and then in each parent directory,
 // the same search Git does when you run a command in a subfolder.
+//
+// In a linked worktree (made by `git worktree add`) or a submodule, .git is
+// a file that says where the real .git folder is. mgit does not follow it,
+// and refuses to run there rather than climb past it: the repository it
+// would find higher up is not the one you are in.
 func Find(start string) (*Repo, error) {
 	dir, err := filepath.Abs(start)
 	if err != nil {
 		return nil, err
 	}
 	for range maxParentDirs {
-		if fi, err := os.Stat(filepath.Join(dir, ".git")); err == nil && fi.IsDir() {
+		gitPath := filepath.Join(dir, ".git")
+		fi, err := os.Stat(gitPath)
+		switch {
+		case err == nil && fi.IsDir():
 			return open(dir), nil
+		case err == nil:
+			return nil, fmt.Errorf("%s is a file, not a folder: mgit does not support linked worktrees and submodules", gitPath)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {

@@ -96,30 +96,54 @@ func resolveBase(r *repo.Repo, base string) (object.Hash, error) {
 	return object.Hash{}, fmt.Errorf("unknown revision %q", base)
 }
 
-// refCandidates lists the full ref names a name can stand for, in the order
-// Git tries them when you type a short name like "main". A tag and a branch
-// with the same name are allowed; the tag wins.
-func refCandidates(name string) []string {
-	list := make([]string, 0, 6)
-	if repo.IsPseudoRef(name) || strings.HasPrefix(name, "refs/") {
-		list = append(list, name) // HEAD, ORIG_HEAD, refs/heads/main: as is
+// refRule is one of Git's rules for turning a short name into a full ref
+// name: prefix + name + suffix.
+type refRule struct{ prefix, suffix string }
+
+// refRules returns Git's rules (ref_rev_parse_rules) in the order Git tries
+// them when you type a short name like "main". A tag and a branch with the
+// same name are allowed; the tag wins.
+func refRules() [6]refRule {
+	return [6]refRule{
+		{"", ""}, // HEAD, ORIG_HEAD, refs/heads/main: the name as it is
+		{"refs/", ""},
+		{"refs/tags/", ""},
+		{"refs/heads/", ""},
+		{"refs/remotes/", ""},
+		{"refs/remotes/", "/HEAD"}, // "origin" is origin's default branch
 	}
-	return append(list,
-		"refs/"+name,
-		"refs/tags/"+name,
-		"refs/heads/"+name,
-		"refs/remotes/"+name,
-		"refs/remotes/"+name+"/HEAD",
-	)
+}
+
+// refCandidates lists the full ref names a name can stand for, in the order
+// of refRules. Names that are not valid ref names are left out: no such ref
+// can exist ("main" itself, for example, is neither HEAD-like nor refs/...).
+func refCandidates(name string) []string {
+	rules := refRules()
+	list := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		if ref := rule.prefix + name + rule.suffix; repo.CheckRefName(ref) == nil {
+			list = append(list, ref)
+		}
+	}
+	return list
+}
+
+// resolveCandidate resolves one candidate of refCandidates. Like Git, it
+// skips a broken ref (a file that holds no hash): a broken branch v1 must
+// not hide the tag v1, or stop a name from being resolved at all.
+func resolveCandidate(r *repo.Repo, ref string) (object.Hash, bool, error) {
+	h, ok, err := r.ResolveRef(ref)
+	var broken *repo.BrokenRefError
+	if errors.As(err, &broken) {
+		return object.Hash{}, false, nil
+	}
+	return h, ok, err
 }
 
 // resolveRefName returns the first candidate ref that exists.
 func resolveRefName(r *repo.Repo, name string) (object.Hash, bool, error) {
 	for _, ref := range refCandidates(name) {
-		if repo.CheckRefName(ref) != nil {
-			continue // not a valid ref name, so no such ref can exist
-		}
-		h, ok, err := r.ResolveRef(ref)
+		h, ok, err := resolveCandidate(r, ref)
 		if err != nil || ok {
 			return h, ok, err
 		}
@@ -134,10 +158,7 @@ func resolveRefName(r *repo.Repo, name string) (object.Hash, bool, error) {
 func RefMatches(r *repo.Repo, name string) (int, error) {
 	n := 0
 	for _, ref := range refCandidates(name) {
-		if repo.CheckRefName(ref) != nil {
-			continue
-		}
-		_, ok, err := r.ResolveRef(ref)
+		_, ok, err := resolveCandidate(r, ref)
 		if err != nil {
 			return n, err
 		}
@@ -146,6 +167,48 @@ func RefMatches(r *repo.Repo, name string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// ShortRefName returns the shortest name that leads to the ref full and to
+// nothing else, the way `git branch` shows where a symbolic ref points
+// (shorten_unambiguous_ref, in its strict mode): refs/tags/v1 is "v1", but
+// "heads/topic" when a tag topic exists too, since "topic" would mean the
+// tag. It tries the most specific rule first. When no short name is
+// unambiguous, it returns full itself.
+func ShortRefName(r *repo.Repo, full string) string {
+	rules := refRules()
+	for i := len(rules) - 1; i > 0; i-- {
+		short, ok := matchRule(full, rules[i])
+		if ok && !otherRuleMatches(r, short, i) {
+			return short
+		}
+	}
+	return full
+}
+
+// matchRule returns the name that rule turns into full, if any.
+func matchRule(full string, rule refRule) (string, bool) {
+	rest, ok := strings.CutPrefix(full, rule.prefix)
+	if !ok {
+		return "", false
+	}
+	short, ok := strings.CutSuffix(rest, rule.suffix)
+	return short, ok && short != ""
+}
+
+// otherRuleMatches reports whether a rule other than rules[skip] turns short
+// into a ref that exists.
+func otherRuleMatches(r *repo.Repo, short string, skip int) bool {
+	for j, rule := range refRules() {
+		ref := rule.prefix + short + rule.suffix
+		if j == skip || repo.CheckRefName(ref) != nil {
+			continue
+		}
+		if _, ok, err := r.ResolveRef(ref); err == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
 func isHex(s string) bool {

@@ -44,37 +44,74 @@ func runBranch(args []string, out *output) error {
 	return usageError(branchUsage)
 }
 
-// listBranches prints every branch, with a * before the current one. Like
-// git, it skips broken refs with a warning, and shows a symbolic ref as
-// "name -> target".
+// listBranches prints every branch, with "* " before the current one and
+// "+ " before a branch that another worktree has checked out. Like git, it
+// skips broken refs with a warning, and shows a symbolic ref as
+// "name -> target", where target is the ref at the end of the links, as
+// short as it can be without meaning another ref.
 func listBranches(r *repo.Repo, out *output) error {
 	head, err := r.Head()
 	if err != nil {
 		return err
 	}
-	branches, broken, err := r.ListRefs("refs/heads/")
+	branches, skipped, err := r.ListRefs("refs/heads/")
 	if err != nil {
 		return err
 	}
 	msgs := newOutput(os.Stderr)
-	for _, name := range broken {
-		msgs.printf("warning: ignoring broken ref %s\n", name)
-	}
+	warnSkipped(msgs, skipped)
+	worktrees := r.Worktrees()
 	if head.Branch == "" {
-		out.printf("* (HEAD detached at %s)\n", r.Objects.Abbrev(head.Commit, 7))
+		out.printf("* %s\n", headDescription(r, head, &worktrees[0]))
+	}
+	marks := map[string]string{} // "+ " for the branches of every worktree...
+	for i := range worktrees {
+		marks[worktrees[i].Head] = "+ "
+	}
+	if head.Branch != "" {
+		marks["refs/heads/"+head.Branch] = "* " // ...but "* " for this one's
 	}
 	for _, b := range branches {
-		name := strings.TrimPrefix(b.Name, "refs/heads/")
-		mark := "  "
-		if name == head.Branch {
-			mark = "* "
+		mark, ok := marks[b.Name]
+		if !ok {
+			mark = "  "
 		}
+		name := strings.TrimPrefix(b.Name, "refs/heads/")
 		if b.Target != "" {
-			name += " -> " + strings.TrimPrefix(b.Target, "refs/heads/")
+			name += " -> " + revision.ShortRefName(r, b.Target)
 		}
 		out.printf("%s%s\n", mark, name)
 	}
 	return msgs.flush()
+}
+
+// warnSkipped warns about the refs that ListRefs skipped, in git's words.
+func warnSkipped(msgs *output, skipped []repo.SkippedRef) {
+	for _, s := range skipped {
+		if s.BadName {
+			msgs.printf("warning: ignoring ref with broken name %s\n", s.Name)
+		} else {
+			msgs.printf("warning: ignoring broken ref %s\n", s.Name)
+		}
+	}
+}
+
+// headDescription is what `git branch` shows for a detached HEAD: the
+// rebase or the bisect that detached it, if one is in progress, or the
+// commit HEAD is at. Git names the branch or tag HEAD was detached from
+// when its reflog remembers it; mgit keeps no reflog, so it names the
+// commit.
+func headDescription(r *repo.Repo, head repo.Head, wt *repo.Worktree) string {
+	at := r.Objects.Abbrev(head.Commit, 7)
+	switch {
+	case wt.Rebase && wt.Rebasing != "":
+		return "(no branch, rebasing " + wt.Rebasing + ")"
+	case wt.Rebase:
+		return "(no branch, rebasing detached HEAD " + at + ")"
+	case wt.Bisect && wt.Bisecting != "":
+		return "(no branch, bisect started on " + wt.Bisecting + ")"
+	}
+	return "(HEAD detached at " + at + ")"
 }
 
 // createBranch makes a new branch that points at start, or at HEAD's commit
@@ -149,7 +186,14 @@ func deleteBranches(r *repo.Repo, names []string, force bool, out *output) error
 	if err != nil {
 		return err
 	}
-	d := &deleter{r: r, head: head, force: force}
+	chain, err := r.HeadChain()
+	if err != nil {
+		return err
+	}
+	d := &deleter{r: r, head: head, force: force, current: map[string]bool{}, inUse: repo.BranchesInUse(r.Worktrees())}
+	for _, ref := range chain {
+		d.current[ref] = true
+	}
 	var errs []error
 	var doomed []doomedBranch
 	seen := map[string]bool{}
@@ -179,10 +223,12 @@ func deleteBranches(r *repo.Repo, names []string, force bool, out *output) error
 
 // deleter deletes branches for `mgit branch -d` and `-D`.
 type deleter struct {
-	r      *repo.Repo
-	head   repo.Head
-	force  bool                 // -D: delete even if commits would be lost
-	merged map[object.Hash]bool // the commits in HEAD's history, read when first needed
+	r       *repo.Repo
+	head    repo.Head
+	force   bool                 // -D: delete even if commits would be lost
+	current map[string]bool      // the refs HEAD leads through: the current branch, and any link to it HEAD uses
+	inUse   map[string]string    // the branches worktrees use, and where (see repo.BranchesInUse)
+	merged  map[object.Hash]bool // the commits in HEAD's history, read when first needed
 }
 
 // doomedBranch is a branch that deleter.check allowed to be deleted.
@@ -193,17 +239,24 @@ type doomedBranch struct {
 }
 
 // check finds the branch called name and decides whether it may be deleted.
-// Without force, a branch with commits that HEAD's history does not have is
-// refused: with the branch gone, nothing would point to them any more. A
-// symbolic ref holds no commits of its own, so it is never refused.
+// A branch that a worktree uses is refused: the one HEAD leads to (or
+// passes through, when HEAD points to a symbolic ref such as master ->
+// main), one that another worktree has checked out, and one that a rebase
+// or a bisect will come back to. Without force, a branch with commits that
+// HEAD's history does not have is refused too: with the branch gone,
+// nothing would point to them any more. A symbolic ref holds no commits of
+// its own, so that check never refuses it.
 func (d *deleter) check(name string) (doomedBranch, error) {
 	ref, err := repo.BranchRef(name)
 	if err != nil {
 		return doomedBranch{}, err
 	}
 	b := doomedBranch{name: name, ref: ref}
-	if name == d.head.Branch {
+	if d.current[ref] {
 		return b, fmt.Errorf("cannot delete branch '%s': it is the current branch (switch to another one first)", name)
+	}
+	if path, used := d.inUse[ref]; used {
+		return b, fmt.Errorf("cannot delete branch '%s' used by worktree at '%s'", name, path)
 	}
 	target, isSymref, err := d.r.SymrefTarget(ref)
 	if err != nil || isSymref {

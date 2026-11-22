@@ -35,7 +35,7 @@ func (r *Repo) Head() (Head, error) {
 	if err != nil {
 		return Head{}, err
 	}
-	h, ok, err := r.ResolveRef("HEAD")
+	h, ok, err := r.ResolveRef(target)
 	if err != nil {
 		return Head{}, err
 	}
@@ -46,25 +46,55 @@ func (r *Repo) Head() (Head, error) {
 	return head, nil
 }
 
-// HeadTarget returns the ref HEAD points to, such as "refs/heads/main". When
-// HEAD is detached (holds a commit hash itself) it returns "HEAD": the commit
-// command then moves HEAD directly instead of a branch.
+// HeadTarget returns the branch HEAD leads to, such as "refs/heads/main".
+// When HEAD is detached (holds a commit hash itself) it returns "HEAD": the
+// commit command then moves HEAD directly instead of a branch.
+//
+// A branch can itself be a symbolic ref: many repositories keep
+// refs/heads/master as a link to refs/heads/main. When HEAD points to
+// master, HeadTarget follows every link, as Git does, and returns
+// refs/heads/main: that is the branch a commit moves, and the one
+// `git status` names.
 func (r *Repo) HeadTarget() (string, error) {
-	raw, err := bounded.ReadFile(filepath.Join(r.GitDir, "HEAD"), maxRefFileSize)
+	return r.headTarget("HEAD")
+}
+
+// headTarget does HeadTarget's work for a HEAD file: .git/HEAD, or the HEAD
+// of a linked worktree (see Worktrees). rel is its path inside .git.
+func (r *Repo) headTarget(rel string) (string, error) {
+	raw, err := bounded.ReadFile(filepath.Join(r.GitDir, filepath.FromSlash(rel)), maxRefFileSize)
 	if err != nil {
 		return "", err
 	}
 	content := strings.TrimSpace(string(raw))
 	if ref, ok := strings.CutPrefix(content, "ref: "); ok {
 		if err := CheckRefName(ref); err != nil || !strings.HasPrefix(ref, "refs/") {
-			return "", fmt.Errorf(".git/HEAD is corrupt: it points to %q", ref)
+			return "", fmt.Errorf(".git/%s is corrupt: it points to %q", rel, ref)
 		}
-		return ref, nil
+		last, _, _, err := r.resolve(ref)
+		return last, err
 	}
 	if _, err := object.ParseHash(content); err != nil {
-		return "", fmt.Errorf(".git/HEAD is corrupt: %w", err)
+		return "", fmt.Errorf(".git/%s is corrupt: %w", rel, err)
 	}
 	return "HEAD", nil
+}
+
+// HeadChain returns the refs HEAD passes through, in order: for HEAD ->
+// refs/heads/master -> refs/heads/main, it is [refs/heads/master
+// refs/heads/main]. It is empty when HEAD is detached.
+func (r *Repo) HeadChain() ([]string, error) {
+	var chain []string
+	name := "HEAD"
+	for range maxSymrefDepth {
+		target, ok, err := r.SymrefTarget(name)
+		if err != nil || !ok {
+			return chain, err
+		}
+		chain = append(chain, target)
+		name = target
+	}
+	return chain, &BrokenRefError{Ref: "HEAD", Err: fmt.Errorf("more than %d levels of symbolic refs", maxSymrefDepth)}
 }
 
 // ResolveRef reads a reference such as "HEAD" or "refs/heads/main" and
@@ -75,32 +105,41 @@ func (r *Repo) HeadTarget() (string, error) {
 // HEAD), which is followed. Git may also keep many refs in one file,
 // .git/packed-refs, so that is checked when there is no separate file.
 func (r *Repo) ResolveRef(ref string) (object.Hash, bool, error) {
+	_, h, ok, err := r.resolve(ref)
+	return h, ok, err
+}
+
+// resolve does ResolveRef's work, and also returns the last ref it reached
+// by following "ref: " links: the one that holds a hash, or that does not
+// exist. For a ref that is not symbolic, that is the ref itself.
+func (r *Repo) resolve(ref string) (string, object.Hash, bool, error) {
 	if err := CheckRefName(ref); err != nil {
-		return object.Hash{}, false, err
+		return ref, object.Hash{}, false, err
 	}
 	name := ref
 	for range maxSymrefDepth {
-		content, found, err := r.readRefFile(name)
-		if err != nil {
-			return object.Hash{}, false, err
+		content, found, readErr := r.readRefFile(name)
+		if readErr != nil {
+			return name, object.Hash{}, false, readErr
 		}
 		if !found {
-			return r.packedRef(name)
+			h, ok, err := r.packedRef(name)
+			return name, h, ok, err
 		}
-		if next, ok := strings.CutPrefix(content, "ref: "); ok {
-			if err = CheckRefName(next); err != nil {
-				return object.Hash{}, false, &BrokenRefError{Ref: name, Err: err}
+		next, isSymref := strings.CutPrefix(content, "ref: ")
+		if !isSymref {
+			h, err := object.ParseHash(content)
+			if err != nil {
+				return name, h, false, &BrokenRefError{Ref: name, Err: err}
 			}
-			name = next
-			continue
+			return name, h, true, nil
 		}
-		h, err := object.ParseHash(content)
-		if err != nil {
-			return h, false, &BrokenRefError{Ref: name, Err: err}
+		if err := CheckRefName(next); err != nil {
+			return name, object.Hash{}, false, &BrokenRefError{Ref: name, Err: err}
 		}
-		return h, true, nil
+		name = next
 	}
-	return object.Hash{}, false, &BrokenRefError{Ref: ref, Err: fmt.Errorf("more than %d levels of symbolic refs", maxSymrefDepth)}
+	return name, object.Hash{}, false, &BrokenRefError{Ref: ref, Err: fmt.Errorf("more than %d levels of symbolic refs", maxSymrefDepth)}
 }
 
 // BrokenRefError is the error for a ref file that holds nothing usable:
@@ -138,7 +177,7 @@ func (r *Repo) readRefFile(ref string) (string, bool, error) {
 
 // packedRef looks a ref up in .git/packed-refs (see readPackedRefs).
 func (r *Repo) packedRef(ref string) (object.Hash, bool, error) {
-	refs, err := r.readPackedRefs()
+	refs, _, err := r.readPackedRefs()
 	if err != nil {
 		return object.Hash{}, false, err
 	}

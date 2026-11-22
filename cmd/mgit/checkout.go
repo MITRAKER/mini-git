@@ -55,7 +55,7 @@ func runCheckout(args []string, out *output) error {
 	if len(create) == 1 {
 		t, err = newBranchTarget(r, head, create[0], fs.Arg(0))
 	} else {
-		t, err = findTarget(r, fs.Arg(0))
+		t, err = findTarget(r, head, fs.Arg(0))
 	}
 	if err != nil {
 		return err
@@ -65,15 +65,18 @@ func runCheckout(args []string, out *output) error {
 
 // findTarget works out what `mgit checkout <name>` means: the branch with
 // that name if there is one, otherwise any revision that leads to a commit,
-// which detaches HEAD.
-func findTarget(r *repo.Repo, name string) (target, error) {
+// which detaches HEAD. Like Git, it takes a broken branch file for no
+// branch at all, so that a tag with the same name still works.
+func findTarget(r *repo.Repo, head repo.Head, name string) (target, error) {
 	if ref, err := repo.BranchRef(name); err == nil {
 		h, ok, err := r.ResolveRef(ref)
-		if err != nil {
+		var broken *repo.BrokenRefError
+		switch {
+		case errors.As(err, &broken):
+		case err != nil:
 			return target{}, err
-		}
-		if ok {
-			return target{name: name, ref: ref, commit: h, hasCommit: true}, nil
+		case ok:
+			return target{name: name, ref: ref, commit: h, hasCommit: true}, checkNotElsewhere(r, head, name, ref)
 		}
 	}
 	h, err := revision.Resolve(r, name)
@@ -86,6 +89,20 @@ func findTarget(r *repo.Repo, name string) (target, error) {
 		return target{}, fmt.Errorf("cannot switch to '%s': it is a %s, not a commit", name, wrong.Got)
 	}
 	return target{name: name, commit: c, hasCommit: true}, err
+}
+
+// checkNotElsewhere refuses to switch to a branch that another worktree has
+// checked out, as Git does: two worktrees on one branch would each move it
+// under the other's feet. Like Git, it lets you "switch" to the branch you
+// are on.
+func checkNotElsewhere(r *repo.Repo, head repo.Head, name, ref string) error {
+	if head.Branch != "" && ref == "refs/heads/"+head.Branch {
+		return nil
+	}
+	if path, used := repo.CheckedOutElsewhere(r.Worktrees(), ref); used {
+		return fmt.Errorf("'%s' is already used by worktree at '%s'", name, path)
+	}
+	return nil
 }
 
 // newBranchTarget is `mgit checkout -b <name> [<start>]`. Without a start,

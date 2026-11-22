@@ -25,7 +25,13 @@ const (
 type Ref struct {
 	Name   string      // the full name, such as "refs/heads/main"
 	Hash   object.Hash // what the ref leads to
-	Target string      // for a symbolic ref, the ref it points to; "" otherwise
+	Target string      // for a symbolic ref, the ref it leads to through every link; "" otherwise
+}
+
+// SkippedRef is a ref that ListRefs leaves out because it is broken.
+type SkippedRef struct {
+	Name    string
+	BadName bool // its name breaks Git's rules for ref names, so it was not even read
 }
 
 // ListRefs returns the refs whose names start with prefix, such as
@@ -36,11 +42,12 @@ type Ref struct {
 // a ref is in both, the loose file is newer and wins.
 //
 // Like Git, it leaves out refs that lead nowhere: a symbolic ref to a ref
-// that does not exist, and broken refs (a file that holds no hash, or the
-// all-zero hash). It returns the names of the broken ones separately, so
-// that the caller can warn about them as Git does.
-func (r *Repo) ListRefs(prefix string) ([]Ref, []string, error) {
-	packed, err := r.readPackedRefs()
+// that does not exist, and broken refs: a file that holds no hash, the
+// all-zero hash, or a name that breaks the rules for ref names, such as
+// "refs/heads/bad name". It returns the broken ones separately, sorted by
+// name, so that the caller can warn about them as Git does.
+func (r *Repo) ListRefs(prefix string) ([]Ref, []SkippedRef, error) {
+	packed, badPacked, err := r.readPackedRefs()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -48,37 +55,50 @@ func (r *Repo) ListRefs(prefix string) ([]Ref, []string, error) {
 	for _, p := range packed {
 		found[p.Name] = p
 	}
+	skipped := make(map[string]SkippedRef, len(badPacked))
+	for _, name := range badPacked {
+		skipped[name] = SkippedRef{Name: name, BadName: true}
+	}
 	loose, err := r.looseRefNames()
 	if err != nil {
 		return nil, nil, err
 	}
-	var broken []string
 	for _, name := range loose {
+		delete(found, name) // the loose file wins over a packed copy
+		if CheckRefName(name) != nil {
+			skipped[name] = SkippedRef{Name: name, BadName: true}
+			continue
+		}
 		ref, state, err := r.readLooseRef(name)
 		if err != nil {
 			return nil, nil, err
 		}
-		delete(found, name) // the loose file wins over a packed copy
-		switch {
-		case state == refOK:
+		switch state {
+		case refOK:
 			found[name] = ref
-		case state == refBroken && strings.HasPrefix(name, prefix):
-			broken = append(broken, name)
+		case refBroken:
+			skipped[name] = SkippedRef{Name: name}
+		case refDangling:
 		}
 	}
-	names := make([]string, 0, len(found))
-	for name := range found {
+	return byName(found, prefix), byName(skipped, prefix), nil
+}
+
+// byName returns the values in m whose names start with prefix, sorted by
+// name. Git sorts ref names byte by byte, as sort.Strings does.
+func byName[T any](m map[string]T, prefix string) []T {
+	names := make([]string, 0, len(m))
+	for name := range m {
 		if strings.HasPrefix(name, prefix) {
 			names = append(names, name)
 		}
 	}
 	sort.Strings(names)
-	sort.Strings(broken) // looseRefNames lists a folder's files before its subfolders
-	refs := make([]Ref, len(names))
+	list := make([]T, len(names))
 	for i, name := range names {
-		refs[i] = found[name]
+		list[i] = m[name]
 	}
-	return refs, broken, nil
+	return list
 }
 
 // refState tells whether a loose ref leads anywhere.
@@ -90,17 +110,17 @@ const (
 	refDangling          // a symbolic ref to a ref that does not exist
 )
 
-// readLooseRef reads a ref file that looseRefNames found.
+// readLooseRef reads a ref file that looseRefNames found, whose name is valid.
 func (r *Repo) readLooseRef(name string) (Ref, refState, error) {
 	content, found, err := r.readRefFile(name)
 	if err != nil || !found {
 		return Ref{}, refDangling, err // !found: deleted since it was listed
 	}
+	last, h, exists, err := r.resolve(name)
 	ref := Ref{Name: name}
-	if target, ok := strings.CutPrefix(content, "ref: "); ok {
-		ref.Target = target
+	if strings.HasPrefix(content, "ref: ") {
+		ref.Target = last // like Git, the ref at the end of the links
 	}
-	h, exists, err := r.ResolveRef(name)
 	var brokenErr *BrokenRefError
 	var zero object.Hash
 	switch {
@@ -115,9 +135,12 @@ func (r *Repo) readLooseRef(name string) (Ref, refState, error) {
 	return ref, refOK, nil
 }
 
-// looseRefNames walks .git/refs and returns the name of every ref file in it.
-// Files whose names are not valid ref names, such as a "main.lock" left by a
-// crash, are not refs and are skipped.
+// looseRefNames walks .git/refs and returns the name of every ref file in it,
+// valid or not: a file named "refs/heads/bad name" is a ref Git skips with a
+// warning, but its file is still in the way of new refs. Like Git, it leaves
+// out every file and folder whose name starts with "." or ends with ".lock",
+// such as the "main.lock" a crash can leave behind, and anything that is
+// neither a folder nor a file (a FIFO would make reading it wait forever).
 func (r *Repo) looseRefNames() ([]string, error) {
 	var names []string
 	stack := []string{"refs"}
@@ -137,9 +160,11 @@ func (r *Repo) looseRefNames() ([]string, error) {
 		for _, de := range entries {
 			name := dir + "/" + de.Name()
 			switch {
+			case strings.HasPrefix(de.Name(), ".") || strings.HasSuffix(de.Name(), ".lock"):
+				continue
 			case de.IsDir():
 				stack = append(stack, name)
-			case CheckRefName(name) == nil:
+			case r.isRefFile(name, de):
 				names = append(names, name)
 			}
 		}
@@ -150,41 +175,86 @@ func (r *Repo) looseRefNames() ([]string, error) {
 	return names, nil
 }
 
+// isRefFile reports whether the folder entry de, the ref name, is a file
+// that can hold a ref: a regular file, or a symbolic link to one.
+func (r *Repo) isRefFile(name string, de os.DirEntry) bool {
+	if de.Type().IsRegular() {
+		return true
+	}
+	if de.Type()&os.ModeSymlink == 0 {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(r.GitDir, filepath.FromSlash(name)))
+	return err == nil && fi.Mode().IsRegular()
+}
+
 // readPackedRefs parses .git/packed-refs. After a "#" header line, each line
 // is "<hash> <refname>"; a line "^<hash>" gives the commit that the annotated
 // tag on the line above points to, and is not needed here.
-func (r *Repo) readPackedRefs() ([]Ref, error) {
+//
+// Like Git, it returns a ref whose name breaks the rules for ref names, but
+// cannot lead out of .git/refs, separately: such a ref is broken, and
+// skipped with a warning, while the other refs still work. A name that could
+// lead out of .git/refs means the file is corrupt.
+func (r *Repo) readPackedRefs() ([]Ref, []string, error) {
 	data, err := bounded.ReadFile(filepath.Join(r.GitDir, "packed-refs"), object.MaxSize)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	lines := bytes.Split(data, []byte("\n"))
 	refs := make([]Ref, 0, len(lines))
+	var badNames []string
 	for _, line := range lines {
 		text := strings.TrimSpace(string(line))
 		if text == "" || text[0] == '#' || text[0] == '^' {
 			continue
 		}
 		hx, name, ok := strings.Cut(text, " ")
-		if !ok || CheckRefName(name) != nil {
-			return nil, fmt.Errorf("packed-refs is corrupt: unexpected line %q", text)
+		if !ok {
+			return nil, nil, fmt.Errorf("packed-refs is corrupt: unexpected line %q", text)
 		}
 		h, err := object.ParseHash(hx)
 		if err != nil {
-			return nil, fmt.Errorf("packed-refs is corrupt at %s: %w", name, err)
+			return nil, nil, fmt.Errorf("packed-refs is corrupt at %s: %w", name, err)
 		}
-		refs = append(refs, Ref{Name: name, Hash: h})
+		switch {
+		case CheckRefName(name) == nil:
+			refs = append(refs, Ref{Name: name, Hash: h})
+		case isSafeRefName(name) || CheckRefName("refs/"+name) == nil:
+			// A bad name, or a name outside refs/ that mgit never looks up.
+			badNames = append(badNames, name)
+		default:
+			return nil, nil, fmt.Errorf("packed-refs is corrupt: the ref name %q is dangerous", name)
+		}
 	}
-	return refs, nil
+	return refs, badNames, nil
+}
+
+// isSafeRefName is Git's refname_is_safe: whether a name, even one that
+// breaks the rules of CheckRefName (such as "refs/heads/bad name"), stays
+// inside .git/refs. That is "refs/" and parts that are neither empty, nor
+// "." or ".."; or a name in capitals, like HEAD.
+func isSafeRefName(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/")
+	if !ok {
+		return IsPseudoRef(name)
+	}
+	for _, part := range strings.Split(rest, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // CheckNewRef checks that ref can be created: no ref may have that name,
 // and none may clash with it. Refs are files, so "refs/heads/a" and
 // "refs/heads/a/b" cannot both exist (a would be a file and a folder). Every
-// ref file counts here, a broken one too, since its file is in the way.
+// ref counts here, a broken one or one with a bad name too, since its file
+// (or its line in packed-refs) is in the way.
 func (r *Repo) CheckNewRef(ref string) error {
 	if err := CheckRefName(ref); err != nil {
 		return err
@@ -193,13 +263,14 @@ func (r *Repo) CheckNewRef(ref string) error {
 	if err != nil {
 		return err
 	}
-	packed, err := r.readPackedRefs()
+	packed, badPacked, err := r.readPackedRefs()
 	if err != nil {
 		return err
 	}
 	for _, p := range packed {
 		names = append(names, p.Name)
 	}
+	names = append(names, badPacked...)
 	for _, name := range names {
 		switch {
 		case name == ref:
@@ -274,7 +345,11 @@ func (r *Repo) SymrefTarget(ref string) (string, bool, error) {
 }
 
 // DeleteSymref deletes the symbolic ref itself, not the ref it points to,
-// if it still points to target. Symbolic refs are never packed.
+// if it still points to target. A symbolic ref is always a loose file, but
+// a packed line with the same name may hide behind it: a branch that
+// `git pack-refs` packed, and that was later turned into a symbolic ref.
+// Like DeleteRef, it removes that line too; otherwise the old branch would
+// come back to life.
 func (r *Repo) DeleteSymref(ref, target string) error {
 	if IsPseudoRef(ref) {
 		return fmt.Errorf("cannot delete %s", ref)
@@ -287,6 +362,9 @@ func (r *Repo) DeleteSymref(ref, target string) error {
 	cur, isSymref, err := r.SymrefTarget(ref)
 	if err == nil && (!isSymref || cur != target) {
 		err = fmt.Errorf("cannot delete %s: it changed while this command was running", ref)
+	}
+	if err == nil {
+		err = r.removePackedRef(ref)
 	}
 	if err == nil {
 		err = os.Remove(p)

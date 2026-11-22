@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,4 +109,161 @@ func TestBranchWithOddRefsMatchesGit(t *testing.T) {
 	} {
 		w.run(args...)
 	}
+}
+
+// Many repositories keep master as a symbolic ref to main. With HEAD on
+// master, git's current branch is main: the one marked with "*", the one a
+// commit moves (master stays a link), and one that cannot be deleted.
+func TestSymbolicHeadMatchesGit(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "symbolic-ref", "refs/heads/master", "refs/heads/main")
+		git(t, dir, "checkout", "-q", "master")
+	})
+	w.run("branch")
+	w.run("branch", "-d", "main")
+	w.run("status", "--short")
+	// The commit messages differ (git also names the author when it is not
+	// the committer), so the commits are made one by one; the next run
+	// compares the refs.
+	git(t, w.git, "commit", "-q", "--allow-empty", "-m", "on main")
+	mgit(t, w.mgit, "commit", "--allow-empty", "-m", "on main")
+	w.run("checkout", "main")
+	w.run("checkout", "master")
+	w.run("branch")
+	// Here git deletes master and leaves HEAD pointing to a branch that no
+	// longer exists; mgit refuses (see LEARNING.md, lesson 5).
+	if msg := mgitFails(t, w.mgit, nil, "branch", "-d", "master"); !strings.Contains(msg, "is the current branch") {
+		t.Errorf("branch -d master: %s", msg)
+	}
+	// With HEAD on main itself, master is only a link: both delete it.
+	w.both(func(dir string) { git(t, dir, "checkout", "-q", "main") })
+	w.run("branch", "-d", "master")
+}
+
+// git shows where a symbolic ref leads at the end of its links, with the
+// shortest name that means that ref and nothing else.
+func TestBranchShowsWhereSymbolicRefsLeadLikeGit(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "tag", "v1")
+		git(t, dir, "tag", "b", "b") // a tag with a branch's name
+		git(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+		git(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+		for _, link := range [][2]string{
+			{"release", "refs/tags/v1"},
+			{"up", "refs/remotes/origin/HEAD"},
+			{"to-b", "refs/heads/b"}, // "b" would mean the tag: shown as heads/b
+			{"a1", "refs/heads/a2"},  // a chain: a1 -> a2 -> main
+			{"a2", "refs/heads/main"},
+		} {
+			git(t, dir, "symbolic-ref", "refs/heads/"+link[0], link[1])
+		}
+	})
+	w.run("branch")
+	w.run("branch", "-d", "a1") // "(was refs/heads/a2)": the link itself
+	w.run("branch")
+}
+
+// packed-refs can hold what a loose file hides, and names git no longer
+// accepts. A branch that was packed, then turned into a symbolic ref, is
+// stored twice: deleting it must delete both. A packed ref with a bad name
+// is skipped with a warning, and must not break any command.
+func TestPackedRefsBehindLooseOnesMatchGit(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "branch", "sym", "b")
+		git(t, dir, "pack-refs", "--all")
+		git(t, dir, "symbolic-ref", "refs/heads/sym", "refs/heads/main")
+		head := strings.TrimSpace(git(t, dir, "rev-parse", "HEAD"))
+		p := filepath.Join(dir, ".git", "packed-refs")
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Without the "sorted" promise, git sorts the lines itself.
+		packed := strings.Replace(string(data), " sorted ", " ", 1) + head + " refs/heads/bad name\n"
+		writeFile(t, dir, ".git/packed-refs", packed, 0o644)
+	})
+	if msg := w.run("branch").stderr; !strings.Contains(msg, "warning: ignoring ref with broken name refs/heads/bad name\n") {
+		t.Errorf("branch does not warn about the bad name:\n%s", msg)
+	}
+	for _, args := range [][]string{
+		{"status", "--short"},
+		{"log", "--oneline"},
+		{"rev-parse", "sym"},
+		{"branch", "-d", "sym"}, // the snapshot shows that the packed copy is gone too
+		{"branch"},
+	} {
+		w.run(args...)
+	}
+}
+
+// A broken branch file, as a crash can leave behind, that only shares its
+// name with the tag v1: like git, mgit skips it and takes the tag.
+func TestBrokenBranchDoesNotHideATag(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "tag", "v1", "b")
+		writeFile(t, dir, ".git/refs/heads/v1", "", 0o644)
+	})
+	for _, args := range [][]string{
+		{"rev-parse", "v1"},
+		{"branch", "new", "v1"},
+		{"checkout", "-b", "n2", "v1"},
+		{"checkout", "v1"},
+	} {
+		w.run(args...)
+	}
+}
+
+// A branch checked out in another worktree (`git worktree add`) is in use:
+// git marks it with "+", and refuses to check it out a second time or to
+// delete it.
+func TestBranchesOfOtherWorktreesMatchGit(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "worktree", "add", "-q", dir+"-wt", "b")
+		git(t, dir, "worktree", "add", "-q", "--detach", dir+"-detached", "c")
+	})
+	for _, args := range [][]string{
+		{"branch"},
+		{"checkout", "b"},
+		{"branch", "-D", "b"},
+		{"checkout", "c"}, // the other worktree is detached at c: not in use
+		{"branch"},
+	} {
+		w.run(args...)
+	}
+	// mgit does not work inside a linked worktree, where .git is a file.
+	if msg := mgitFails(t, w.mgit+"-wt", nil, "status"); !strings.Contains(msg, "linked worktrees") {
+		t.Errorf("status in a linked worktree: %s", msg)
+	}
+}
+
+// During a rebase or a bisect, HEAD is detached, but the branch it started
+// from is in use: git names it in the list, and refuses to delete it.
+func TestBranchDuringARebaseOrABisectMatchesGit(t *testing.T) {
+	rebase := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "checkout", "-q", "b")
+		// An exec step that fails stops the rebase after its first pick.
+		if res := execIn(dir, nil, "", "git", "rebase", "-q", "-x", "false", "main"); res.err == nil {
+			t.Fatal("the rebase did not stop")
+		}
+	})
+	rebase.run("branch")
+	rebase.run("branch", "-D", "b")
+
+	bisect := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "checkout", "-q", "-b", "long")
+		for i := range 4 {
+			writeFile(t, dir, "f", fmt.Sprintf("step %d\n", i), 0o644)
+			git(t, dir, "commit", "-q", "-am", fmt.Sprintf("step %d", i))
+		}
+		git(t, dir, "bisect", "start", "long", "main")
+	})
+	bisect.run("branch")
+	bisect.run("branch", "-D", "long")
 }

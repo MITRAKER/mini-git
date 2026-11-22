@@ -259,4 +259,54 @@ func TestHead(t *testing.T) {
 	if err != nil || head.Branch != "" || !head.HasCommit || head.Commit != h {
 		t.Errorf("detached HEAD: %+v, %v", head, err)
 	}
+	if chain, err := r.HeadChain(); err != nil || len(chain) != 0 {
+		t.Errorf("detached HEAD: chain %v, %v", chain, err)
+	}
+}
+
+// Many repositories keep refs/heads/master as a symbolic ref to
+// refs/heads/main. With HEAD on master, the current branch is main, as for
+// Git: a commit must move main, not turn master into a plain branch.
+func TestHeadThroughASymbolicBranch(t *testing.T) {
+	r := newTestRepo(t)
+	h := object.Compute(object.Blob, []byte("x"))
+	write(t, gitFile(r, "refs/heads/main"), h.String()+"\n")
+	write(t, gitFile(r, "refs/heads/master"), "ref: refs/heads/main\n")
+	write(t, filepath.Join(r.GitDir, "HEAD"), "ref: refs/heads/master\n")
+	head, err := r.Head()
+	if err != nil || head.Branch != "main" || !head.HasCommit || head.Commit != h {
+		t.Errorf("Head() = %+v, %v; want main at %s", head, err, h)
+	}
+	target, err := r.HeadTarget()
+	if err != nil || target != "refs/heads/main" {
+		t.Errorf("HeadTarget() = %q, %v", target, err)
+	}
+	chain, err := r.HeadChain()
+	if want := []string{"refs/heads/master", "refs/heads/main"}; err != nil || strings.Join(chain, " ") != strings.Join(want, " ") {
+		t.Errorf("HeadChain() = %v, %v; want %v", chain, err, want)
+	}
+	// An unborn branch at the end of the links: no commit yet.
+	write(t, gitFile(r, "refs/heads/master"), "ref: refs/heads/new\n")
+	head, err = r.Head()
+	if err != nil || head.Branch != "new" || head.HasCommit {
+		t.Errorf("Head() through an unborn branch = %+v, %v", head, err)
+	}
+	write(t, gitFile(r, "refs/heads/master"), "ref: refs/heads/master\n")
+	if _, err := r.Head(); err == nil {
+		t.Error("Head() through a loop succeeded")
+	}
+	if _, err := r.HeadChain(); err == nil {
+		t.Error("HeadChain() through a loop succeeded")
+	}
+}
+
+// In a linked worktree or a submodule, .git is a file. mgit cannot follow
+// it, and must not climb past it to a repository further up either.
+func TestFindRefusesAGitFile(t *testing.T) {
+	r := newTestRepo(t)
+	inner := filepath.Join(r.WorkTree, "linked")
+	write(t, filepath.Join(inner, ".git"), "gitdir: "+filepath.Join(r.GitDir, "worktrees", "linked")+"\n")
+	if found, err := Find(inner); err == nil || !strings.Contains(err.Error(), "is a file") {
+		t.Errorf("Find(linked worktree) = %+v, %v; want an error", found, err)
+	}
 }

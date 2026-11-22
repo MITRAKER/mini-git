@@ -102,8 +102,8 @@ func (w *twins) runIn(sub string, args ...string) cmdResult {
 }
 
 // snapshot describes everything checkout and branch can change: HEAD, the
-// refs, the index, what status reports, and every file on disk with its
-// type, permissions and contents.
+// refs (and where symbolic ones point), the index, what status reports, and
+// every file on disk with its type, permissions and contents.
 func snapshot(t *testing.T, dir string) string {
 	t.Helper()
 	head, err := os.ReadFile(filepath.Join(dir, ".git", "HEAD"))
@@ -112,7 +112,7 @@ func snapshot(t *testing.T, dir string) string {
 	}
 	var b strings.Builder
 	b.WriteString("HEAD: " + string(head))
-	b.WriteString(git(t, dir, "for-each-ref", "--format=%(refname) %(objectname)"))
+	b.WriteString(git(t, dir, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"))
 	b.WriteString("index:\n" + git(t, dir, "ls-files", "-s"))
 	b.WriteString("status:\n" + git(t, dir, "status", "--porcelain", "--untracked-files=all"))
 	b.WriteString("files:\n")
