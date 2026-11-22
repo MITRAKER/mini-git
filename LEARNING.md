@@ -336,15 +336,38 @@ unstaged one. `AM` means "added to the index, then modified again on disk".
 ### 2.6 The stat cache, and why it is subtle
 
 Hashing every file on every `status` would be slow in a big project. So the
-index keeps each file's size and modification time. If those still match the
-file on disk (`Entry.StatMatches`), status assumes the file is unchanged and
-skips reading it. Only files whose size or timestamp changed get re-hashed.
+index keeps what `stat` said about each file when it was added: its size,
+when its contents last changed (**mtime**), when its inode last changed
+(**ctime**: `chmod` and `mv` change it too), its inode number, its owner and
+group, and its mode. If all of those still match the file on disk
+(`Entry.StatMatches`), status assumes the file is unchanged and skips
+reading it. These are the fields Git compares, and each one matters:
+anyone can set a file's mtime back (`touch -r`, `cp -p`, or a tool that
+restores times), but writing to a file always moves its ctime, so the edit
+is still noticed (`TestStatusSeesAnEditWithTheOldTime`).
 
-There is a catch called **"racy Git"**: if you edit a file within the same
-timestamp tick that `add` recorded it, size and time can match even though the
-contents changed. Git has extra rules to catch this. mgit compares
-nanosecond timestamps, which makes the window tiny but not zero; it is a good
-example of the trade-off between speed and certainty that real systems make.
+Of the mode, Git keeps only what it can store: a file, an executable file,
+or a symbolic link. "Executable" means that the **owner** may run it
+(`chmod u+x`); a file that only its group or others may run is a plain file,
+in Git and in mgit (`index.ModeOf`).
+
+There is a catch called **"racy Git"**. Clocks tick in steps, and a file
+can change twice within one step: then the second change leaves its size
+and times as the first one did. If the index was written in that same step,
+its entry describes the first version and still matches. Git's answer:
+an entry whose mtime is not older than the index file itself proves
+nothing. Such a **racily clean** entry is never trusted (`Index.UpToDate`):
+status reads and hashes the file.
+
+That rule has a weak spot. The next time the index is written, the index
+file becomes newer than the entry, and the entry would look safe again. So
+before a command writes the index, `status.CheckRacy` reads each racily
+clean file once more. If it changed, its entry is **smudged**: its size is
+set to 0, which matches no file with contents, so the change can never be
+missed. If not, the entry is marked as checked. Whatever was not checked,
+`Index.CommitLocked` smudges anyway: a missing check costs a read later,
+never a missed change. Git does exactly this, and `git ls-files --debug`
+shows the smudged sizes.
 
 Reading those timestamps needs the operating system's raw `stat` data, which
 Go exposes differently on each platform. That is why there are
@@ -379,6 +402,10 @@ xxd .git/index | head           # see "DIRC", the version and entry count
 5. Harder: `status` hashes changed files but never updates their stat info in
    the index, so it re-hashes them every time. Real Git "refreshes" the index.
    How would you add that?
+6. Change a tracked file, then put its old modification time back with
+   `touch -r` (copy the time from another file you saved first). Why does
+   `mgit status` still see the change? Which field in `Entry.StatMatches`
+   gives it away?
 
 ---
 
@@ -1161,11 +1188,27 @@ its own lock, `packed-refs.lock`, and keeps every other line, including the
 
 **Odd refs.** A ref file can hold garbage, nothing at all, or the all-zero
 hash. Git calls such a ref *broken*: `git branch` leaves it out and warns
-`warning: ignoring broken ref refs/heads/x`. A *symbolic* ref holds
-`ref: refs/heads/main`, as HEAD does; `git branch` lists it as
-`sym -> main`, and leaves it out without a word when it points to a branch
-that does not exist. mgit does the same: `repo.ListRefs` returns the broken
-names separately, so that the command can warn about them.
+`warning: ignoring broken ref refs/heads/x`. A ref whose *name* breaks the
+rules is broken too, such as a line `<hash> refs/heads/bad name` that an old
+tool wrote into `packed-refs`:
+`warning: ignoring ref with broken name refs/heads/bad name`. The other refs
+keep working. Only a name that could lead out of `.git/refs`, such as
+`refs/heads/../../config`, makes the whole file corrupt. When a short name
+is looked up, a broken ref is skipped as well: an empty `refs/heads/v1`
+left by a crash does not hide the tag `v1`. mgit does the same:
+`repo.ListRefs` returns the refs it skipped separately, so that the command
+can warn about them, and `revision.resolveCandidate` skips broken ones.
+Files whose names start with `.` or end in `.lock`, and anything that is
+neither a file nor a folder, are not refs at all.
+
+A *symbolic* ref holds `ref: refs/heads/main`, as HEAD does. `git branch`
+lists it as `sym -> main`, and leaves it out without a word when it points
+to a branch that does not exist. It shows where the links *end*: with
+`a1 -> a2` and `a2 -> main`, both read `-> main`. And it shortens the name
+only as far as it stays unambiguous: a link to `refs/heads/topic` reads
+`-> heads/topic` when there is also a tag `topic`, because `topic` alone
+would mean the tag (`revision.ShortRefName`, after Git's
+`shorten_unambiguous_ref`).
 
 ### 5.2 Creating and deleting branches
 
@@ -1194,12 +1237,47 @@ Deleting comes in two strengths:
 
 - `-D` deletes it anyway.
 
-Neither deletes the branch you are on. Deleting a symbolic ref deletes the
-link, not the branch it points to: `Deleted branch sym (was refs/heads/main).`
-A branch file that holds garbage cannot be deleted at all, by Git or mgit
-("branch not found"): you delete the file by hand. And naming one branch
-twice, `branch -d x x`, deletes nothing: Git deletes all the names in one
+Deleting a symbolic ref deletes the link, not the branch it points to:
+`Deleted branch sym (was refs/heads/main).` If the branch was packed before
+it became a link, its old line in `packed-refs` goes too, as for any branch
+(`repo.DeleteSymref`); otherwise the old branch would come back. A branch
+file that holds garbage cannot be deleted at all, by Git or mgit ("branch
+not found"): you delete the file by hand. And naming one branch twice,
+`branch -d x x`, deletes nothing: Git deletes all the names in one
 transaction, and a transaction may not change one ref twice.
+
+**Branches in use.** Neither `-d` nor `-D` deletes a branch that is in use.
+The obvious one is the branch you are on, but "on" needs care:
+
+- **HEAD can point to a link.** Many repositories keep `master` as a
+  symbolic ref to `main`, so that old scripts still work. After
+  `git checkout master`, HEAD holds `ref: refs/heads/master`, but the branch
+  you are on is `main`: Git follows every link (`repo.HeadTarget`).
+  `git status` says `On branch main`, a commit moves `main` (writing the new
+  hash into `master` would cut the link and make it a branch of its own),
+  and `main` cannot be deleted.
+- **Other worktrees.** `git worktree add ../hotfix hotfix` checks a branch
+  out in a second folder, with its own HEAD and index in
+  `.git/worktrees/hotfix/`; the branches are shared. Git marks such a
+  branch with `+` in `git branch`, and refuses to delete it, or to check it
+  out in a second place, where each worktree would move it under the
+  other's feet:
+
+  ```
+  'hotfix' is already used by worktree at '/home/you/hotfix'
+  ```
+
+- **A rebase or a bisect** detaches HEAD while it works, and comes back to a
+  branch when it ends: `.git/rebase-merge/head-name` and `.git/BISECT_START`
+  name it. That branch is in use too, and so are the branches that
+  `git rebase --update-refs` will move. `git branch` then shows
+  `* (no branch, rebasing topic)`.
+
+`repo.Worktrees` reads all of this the way Git's `get_worktrees` and
+`wt_status_check_rebase` do. mgit itself runs only in the main worktree: in
+a linked worktree, or a submodule, `.git` is a *file* that says where the
+real `.git` folder is. mgit refuses to start there, rather than climb up to
+whatever repository lies above (`repo.Find`).
 
 ### 5.3 Checkout is a two-way merge
 
@@ -1251,11 +1329,35 @@ M	same.txt                    ← standard output: changes that came along
 Switched to branch 'topic'      ← standard error
 ```
 
-Three more details, each the same as in Git:
+More details, each the same as in Git:
 
 - **`checkout -b new` without a start** leaves the files alone. The new
   branch starts at the commit you are on, so there is nothing to switch:
   Git skips the merge, and so does not list your changes either.
+- **No index at all** (after `git clone --no-checkout`, or when
+  `.git/index` was deleted) is not "every file deleted": it means nothing
+  has been checked out yet. Git writes every file of the new commit, and
+  stops only for an untracked file in the way, even one with the right
+  contents (`Index.Unborn`). An index file with no entries is different:
+  it says that you deleted every file, and those deletions are local
+  changes, which come along or stop the switch by the rules above.
+- **The folder you are in stays.** If a file of the new commit must take
+  the place of the folder you run `checkout` from, Git refuses rather than
+  pull the folder out from under your shell:
+
+  ```
+  error: Refusing to remove the current working directory:
+  	d
+  ```
+
+  If the switch only leaves that folder empty, Git keeps it, and removes
+  the other empty folders as usual. mgit does both (`plan.checkCwd`,
+  `removeEmptyFolders`).
+- **Names are quoted** the way Git quotes them (`quote.Path`): a name with
+  a byte below space or above `~`, a `"` or a `\` is printed in double
+  quotes, with C escapes such as `\t` and octal for the rest, so
+  `é.txt` is `"\303\251.txt"`. `status --short` also quotes names with
+  spaces. Every line Git prints for a file stays one line.
 - **An index with a merge conflict** (after a merge that stopped) cannot be
   switched: `checkout` prints `f: needs merge` for each conflicted file, and
   refuses.
@@ -1344,7 +1446,17 @@ The tests compare mgit with Git (5.7), so every difference is a decision:
 - **No reflog.** Git logs every move of HEAD in `.git/logs/HEAD`. That is
   how `git branch` can say `(HEAD detached at v1)`: it remembers that you
   typed `v1`. mgit keeps no reflog, and names the commit:
-  `(HEAD detached at 2a5cb45)`.
+  `(HEAD detached at 2a5cb45)`. During a rebase of a detached HEAD, it also
+  names the commit where Git uses the reflog.
+- **Deleting the link HEAD goes through.** With HEAD on `master`, a link to
+  `main`, `git branch -d master` deletes the link, and leaves HEAD pointing
+  to a branch that no longer exists: the next `git status` says "No commits
+  yet" and shows every file as new. mgit refuses, as for the branch you are
+  on.
+- **Staged work in a folder that becomes a file.** When the new commit has
+  a file `d` where you have a folder `d` with staged work in it (a new file,
+  or a change), Git drops those entries from the index and deletes the
+  files: the work is gone. mgit refuses, and names the files.
 - **A link where a folder was.** When an untracked symbolic link stands
   where a tracked folder was, Git looks through it, and if the file is not
   behind the link, replaces the link with a folder and goes on. mgit never
@@ -1411,6 +1523,17 @@ tree=$(printf '100644 blob %s\tGIT~1\n' $blob | git mktree)
 git branch evil $(git commit-tree -m evil $tree)
 mgit checkout evil; git checkout evil
 
+# A branch that is a link, and a branch in another worktree
+git symbolic-ref refs/heads/master refs/heads/main
+mgit checkout master && mgit status  # HEAD -> master -> main: "On branch main"
+mgit branch                          # * main, then "master -> main"
+mgit checkout main
+git worktree add ../hotfix -b hotfix
+mgit branch                          # + hotfix
+mgit checkout hotfix                 # refused: it is checked out over there
+mgit branch -D hotfix                # refused too
+git worktree remove ../hotfix
+
 # A write that fails half-way
 mgit checkout -b big
 head -c 4000000 /dev/zero > big.bin && mgit add big.bin && mgit commit -m "A big file"
@@ -1442,6 +1565,11 @@ git checkout -- big.bin && mgit status
 6. Harder: add `branch -m <old> <new>` to rename a branch. What must happen
    to HEAD when you rename the branch you are on? And when `<new>` clashes
    with another branch, as in 5.1?
+7. Start a rebase that stops half-way: on a branch, run
+   `git rebase -x false main`. Then run `mgit branch` and
+   `mgit branch -D <branch>`. Which files in `.git` told mgit what is going
+   on? Delete the branch with `git update-ref -d`, then try
+   `git rebase --continue`: what goes wrong?
 
 ---
 

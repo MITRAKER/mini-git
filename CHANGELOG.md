@@ -31,6 +31,14 @@ changes.
   - FIFOs, sockets and devices in the working tree are skipped like git
     skips them, and never opened: `add` and `status` used to wait forever on
     a FIFO.
+  - The stat check compares what git compares: size, modification and
+    change times, inode, owner and mode. An edit is noticed even when the
+    old modification time is put back. Files changed in the same clock tick
+    as the index ("racy git") are read again, and their entries smudged
+    before the index is written, as git does. Only the owner's execute bit
+    makes a file executable, as in git.
+  - File names are quoted as git quotes them (`core.quotePath`) in `status`,
+    `ls-files`, `cat-file -p` of a tree and checkout's list of changes.
 - **History**
   - `commit` (`-m`, `-F`, `-a`, `--allow-empty`), `write-tree`, `commit-tree`,
     `log` (`--oneline`, `-n <number>` or `-<number>`, and revisions to start
@@ -43,10 +51,11 @@ changes.
   - Commits are byte-for-byte identical to git's: the same files, identity,
     date and message give the same commit hash.
 - **Branches**
-  - `branch`: list the branches (`*` marks the current one, and a detached
-    HEAD is shown as `(HEAD detached at <commit>)`), create one at HEAD or
-    at any revision, and delete with `-d` (only when merged into HEAD) or
-    `-D`.
+  - `branch`: list the branches (`*` marks the current one, `+` one
+    checked out in another worktree, and a detached HEAD is shown as
+    `(HEAD detached at <commit>)`, or as the rebase or bisect in progress),
+    create one at HEAD or at any revision, and delete with `-d` (only when
+    merged into HEAD) or `-D`.
   - `checkout <branch>`, `checkout <commit>` (a detached HEAD) and
     `checkout -b <new> [<start>]`. Uncommitted changes come along when both
     commits agree on those files; otherwise checkout refuses, naming the
@@ -54,9 +63,23 @@ changes.
     it too, with git's messages.
   - Leaving a detached HEAD warns about the commits no branch or tag holds,
     as git does.
-  - Refs in `.git/packed-refs` are read, and removed when a branch is
-    deleted. Broken refs are skipped with git's warning, and symbolic refs
-    are listed as `name -> target`.
+  - With no index at all (after `git clone --no-checkout`), checkout writes
+    every file of the new commit, as git does. It never removes the folder
+    it runs in.
+  - HEAD may point to a symbolic branch, such as `master` linked to `main`:
+    as in git, the current branch is the one at the end of the links, which
+    a commit moves and which cannot be deleted.
+  - A branch that another worktree has checked out, or that a rebase, a
+    bisect or `rebase --update-refs` will come back to, cannot be deleted,
+    and checkout refuses a branch checked out in another worktree, as git
+    does. mgit refuses to run inside a linked worktree or a submodule, where
+    `.git` is a file.
+  - Refs in `.git/packed-refs` are read, and removed when a branch (or a
+    symbolic ref that hides a packed branch) is deleted. Broken refs, and
+    refs with names git no longer accepts, are skipped with git's warnings,
+    and a broken ref never hides another ref with the same short name.
+    Symbolic refs are listed as `name -> target`, with the target at the
+    end of the links, as short as git makes it.
   - Paths that some file system would open as `.git` (`.GIT`, `.git.`,
     `git~1`, `.git::$INDEX_ALLOCATION`, or `.git` with invisible Unicode
     characters for macOS), and a symbolic link named `.gitmodules`, are
