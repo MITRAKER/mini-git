@@ -101,22 +101,28 @@ func (w *twins) runIn(sub string, args ...string) cmdResult {
 	return m
 }
 
-// snapshot describes everything checkout and branch can change: HEAD, the
-// refs (and where symbolic ones point), the index, what status reports, and
-// every file on disk with its type, permissions and contents.
+// snapshot describes everything checkout and branch can change: HEAD (a
+// file, or a symbolic link), the refs (and where symbolic ones point), the
+// index, what status reports, and every file on disk with its type,
+// permissions and contents.
 func snapshot(t *testing.T, dir string) string {
 	t.Helper()
-	head, err := os.ReadFile(filepath.Join(dir, ".git", "HEAD"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var b strings.Builder
-	b.WriteString("HEAD: " + string(head))
+	head := filepath.Join(dir, ".git", "HEAD")
+	if target, err := os.Readlink(head); err == nil {
+		b.WriteString("HEAD -> " + target + "\n")
+	} else {
+		data, err := os.ReadFile(head)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.WriteString("HEAD: " + string(data))
+	}
 	b.WriteString(git(t, dir, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"))
 	b.WriteString("index:\n" + git(t, dir, "ls-files", "-s"))
 	b.WriteString("status:\n" + git(t, dir, "status", "--porcelain", "--untracked-files=all"))
 	b.WriteString("files:\n")
-	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == dir {
 			return err
 		}

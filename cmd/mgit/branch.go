@@ -33,6 +33,9 @@ func runBranch(args []string, out *output) error {
 	if err != nil {
 		return err
 	}
+	if err := checkHeadOnBranch(r); err != nil {
+		return err
+	}
 	switch {
 	case *del || *force:
 		return deleteBranches(r, fs.Args(), *force, out)
@@ -42,6 +45,21 @@ func runBranch(args []string, out *output) error {
 		return createBranch(r, fs.Arg(0), fs.Arg(1))
 	}
 	return usageError(branchUsage)
+}
+
+// checkHeadOnBranch refuses, as git does, to work while HEAD leads to a
+// ref that is not a branch: `git symbolic-ref HEAD refs/remotes/origin/main`
+// makes one. Commits then move that ref, and no branch is the current one,
+// so git will not list, create or delete branches until HEAD is fixed.
+func checkHeadOnBranch(r *repo.Repo) error {
+	target, err := r.HeadTarget()
+	if err != nil {
+		return err
+	}
+	if target != "HEAD" && !strings.HasPrefix(target, "refs/heads/") {
+		return errors.New("HEAD not found below refs/heads!") //nolint:revive,staticcheck // error-strings, ST1005: git's own words
+	}
+	return nil
 }
 
 // listBranches prints every branch, with "* " before the current one and
@@ -147,7 +165,10 @@ func newBranchRef(r *repo.Repo, name string) (string, error) {
 }
 
 // startCommit resolves the commit a new branch starts at: a revision such
-// as main, v1.0 or HEAD~2, or HEAD's commit when start is "".
+// as main, v1.0 or HEAD~2. When start is "", git starts from the current
+// branch, by its name: `git branch new` on main is `git branch new main`,
+// so a tag also named main makes it ambiguous, and git refuses. With a
+// detached HEAD, it starts from HEAD's commit.
 func startCommit(r *repo.Repo, start string) (object.Hash, error) {
 	if start == "" {
 		head, err := r.Head()
@@ -157,7 +178,10 @@ func startCommit(r *repo.Repo, start string) (object.Hash, error) {
 		if !head.HasCommit {
 			return object.Hash{}, fmt.Errorf("not a valid object name: '%s' (it has no commits yet)", head.Branch)
 		}
-		return head.Commit, nil
+		if head.Branch == "" {
+			return head.Commit, nil
+		}
+		start = head.Branch
 	}
 	h, err := revision.Resolve(r, start)
 	if err != nil {

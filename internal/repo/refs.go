@@ -62,11 +62,17 @@ func (r *Repo) HeadTarget() (string, error) {
 // headTarget does HeadTarget's work for a HEAD file: .git/HEAD, or the HEAD
 // of a linked worktree (see Worktrees). rel is its path inside .git.
 func (r *Repo) headTarget(rel string) (string, error) {
-	raw, err := bounded.ReadFile(filepath.Join(r.GitDir, filepath.FromSlash(rel)), maxRefFileSize)
-	if err != nil {
-		return "", err
+	p := filepath.Join(r.GitDir, filepath.FromSlash(rel))
+	content, isLink := symlinkRef(p)
+	if isLink {
+		content = "ref: " + content
+	} else {
+		raw, err := bounded.ReadFile(p, maxRefFileSize)
+		if err != nil {
+			return "", err
+		}
+		content = strings.TrimSpace(string(raw))
 	}
-	content := strings.TrimSpace(string(raw))
 	if ref, ok := strings.CutPrefix(content, "ref: "); ok {
 		if err := CheckRefName(ref); err != nil || !strings.HasPrefix(ref, "refs/") {
 			return "", fmt.Errorf(".git/%s is corrupt: it points to %q", rel, ref)
@@ -158,9 +164,13 @@ func (e *BrokenRefError) Unwrap() error { return e.Err }
 // readRefFile returns the trimmed contents of a loose ref file. A missing
 // file, a folder with that name (refs/heads/a when only refs/heads/a/b
 // exists) or a file in place of a folder (refs/heads/a/b when refs/heads/a
-// is a branch) means the ref is not stored as a file.
+// is a branch) means the ref is not stored as a file. A symbolic link that
+// names a ref reads as "ref: <name>" (see symlinkRef).
 func (r *Repo) readRefFile(ref string) (string, bool, error) {
 	p := filepath.Join(r.GitDir, filepath.FromSlash(ref))
+	if target, ok := symlinkRef(p); ok {
+		return "ref: " + target, true, nil
+	}
 	fi, err := os.Stat(p)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || (err == nil && fi.IsDir()) {
 		return "", false, nil
@@ -173,6 +183,25 @@ func (r *Repo) readRefFile(ref string) (string, bool, error) {
 		return "", false, err
 	}
 	return strings.TrimSpace(string(raw)), true, nil
+}
+
+// symlinkRef reads a symbolic ref stored the old way. Before "ref: " files,
+// Git kept HEAD as a symbolic link to the branch file, HEAD ->
+// refs/heads/main, and it still does when core.preferSymlinkRefs is set.
+// Like Git (read_ref_internal in refs/files-backend.c), a link whose target
+// is a ref name under refs/ points to that ref, even when the file it leads
+// to is missing (a packed branch has none). Any other link is not a
+// symbolic ref: its caller follows it to the file it leads to.
+func symlinkRef(p string) (string, bool) {
+	fi, err := os.Lstat(p)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+	target, err := os.Readlink(p)
+	if err != nil || !strings.HasPrefix(target, "refs/") || CheckRefName(target) != nil {
+		return "", false
+	}
+	return target, true
 }
 
 // packedRef looks a ref up in .git/packed-refs (see readPackedRefs).

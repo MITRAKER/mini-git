@@ -267,3 +267,70 @@ func TestBranchDuringARebaseOrABisectMatchesGit(t *testing.T) {
 	bisect.run("branch")
 	bisect.run("branch", "-D", "long")
 }
+
+// Old repositories, and git with core.preferSymlinkRefs, keep HEAD as a
+// symbolic link to the branch file, "HEAD -> refs/heads/b", instead of a
+// "ref: " line. HEAD is still on b: a commit moves b and keeps the link,
+// and b cannot be deleted. When b is packed, the link leads to no file,
+// but it still names b.
+func TestSymlinkedHeadMatchesGit(t *testing.T) {
+	for _, packed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("packed=%v", packed), func(t *testing.T) {
+			w := newTwins(t, func(dir string) {
+				fixture(t, dir)
+				if packed {
+					git(t, dir, "pack-refs", "--all")
+				}
+				git(t, dir, "-c", "core.preferSymlinkRefs=true", "checkout", "-q", "b")
+			})
+			w.run("branch")
+			w.run("status", "--short")
+			// See TestSymbolicHeadMatchesGit for why the commits are made
+			// one by one.
+			git(t, w.git, "commit", "-q", "--allow-empty", "-m", "on b")
+			mgit(t, w.mgit, "commit", "--allow-empty", "-m", "on b")
+			w.run("branch", "-d", "b")
+			w.run("checkout", "main") // a "ref: " file replaces the link, in both
+		})
+	}
+}
+
+// `git symbolic-ref HEAD refs/remotes/origin/main` puts HEAD on a ref that
+// is not a branch: commits then move that ref. git refuses every branch
+// command until HEAD is on a branch again, which checkout still does.
+func TestHeadOutsideTheBranchesMatchesGit(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+		git(t, dir, "symbolic-ref", "HEAD", "refs/remotes/origin/main")
+	})
+	if msg := w.run("branch").stderr; !strings.Contains(msg, "HEAD not found below refs/heads!") {
+		t.Errorf("branch: %s", msg)
+	}
+	for _, args := range [][]string{
+		{"branch", "new"},
+		{"branch", "-D", "b"},
+		{"status", "--short"},
+		{"checkout", "b"},
+		{"branch"},
+	} {
+		w.run(args...)
+	}
+}
+
+// With no start, `git branch new` starts from the current branch by its
+// name, as if it were `git branch new main`: when a tag is named main too,
+// the name is ambiguous and git refuses. HEAD itself is never ambiguous.
+func TestNewBranchFromAnAmbiguousCurrentBranchMatchesGit(t *testing.T) {
+	w := newTwins(t, func(dir string) {
+		fixture(t, dir)
+		git(t, dir, "tag", "main", "b")
+	})
+	if msg := w.run("branch", "new").stderr; !strings.Contains(msg, "ambiguous object name: 'main'") {
+		t.Errorf("branch new: %s", msg)
+	}
+	w.run("branch", "new", "HEAD")
+	w.run("checkout", "-b", "new2")
+	w.both(func(dir string) { git(t, dir, "checkout", "-q", "--detach") })
+	w.run("branch", "new3")
+}
