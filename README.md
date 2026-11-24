@@ -26,8 +26,8 @@ suite uses that to check every result against Git itself.
 | 2. Index | `add`, `status`, `ls-files` | done |
 | 3. History | `commit`, `log`, `rev-parse`, `write-tree`, `commit-tree` | done |
 | Engineering | CI/CD, linters, security scanning, NASA/JPL coding rules | done |
-| 4. Refs | `branch`, `checkout` | next |
-| 5. Diff | `diff` | planned |
+| 4. Branches | `branch`, `checkout` | done |
+| 5. Diff | `diff` | next |
 | 6. Stretch | `merge`, `.gitignore`, tags | planned |
 
 ## Quick start
@@ -43,6 +43,8 @@ echo "hello world" > hello.txt
 ../mgit commit -m "First commit"     # uses user.name and user.email from git config
 ../mgit log
 ../mgit rev-parse HEAD^{tree}
+../mgit checkout -b topic            # a new branch, and switch to it
+../mgit branch
 git log               # real Git understands the repository too
 ```
 
@@ -51,11 +53,12 @@ git log               # real Git understands the repository too
 ```
 cmd/mgit/          command-line entry point, one file per group of commands
 internal/object/   objects: hashing, zlib storage, trees, commits
-internal/repo/     finding/creating repositories, HEAD and refs
+internal/repo/     finding/creating repositories, HEAD, refs and packed-refs
 internal/index/    the staging area in Git's binary index format
 internal/status/   comparing HEAD, the index and the working tree
 internal/history/  index -> trees -> commits, identity, walking history
 internal/revision/ names like HEAD~2, main, v1.0^{} and HEAD:path
+internal/checkout/ switching the files and the index from one commit to another
 internal/config/   reading .gitconfig files
 internal/lockfile/ safe file updates with <file>.lock
 internal/bounded/  reading files and input with a size limit

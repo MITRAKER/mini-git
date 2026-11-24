@@ -8,6 +8,7 @@ import (
 
 	"github.com/MITRAKER/mini-git/internal/index"
 	"github.com/MITRAKER/mini-git/internal/object"
+	"github.com/MITRAKER/mini-git/internal/quote"
 	"github.com/MITRAKER/mini-git/internal/repo"
 	"github.com/MITRAKER/mini-git/internal/status"
 )
@@ -34,6 +35,7 @@ func runAdd(args []string) error {
 			return err
 		}
 	}
+	status.CheckRacy(r, ix)
 	return ix.Write(r.IndexPath())
 }
 
@@ -151,9 +153,9 @@ func runLsFiles(args []string, out *output) error {
 	}
 	for _, e := range ix.Entries {
 		if *stage {
-			out.printf("%06o %s %d\t%s\n", e.Mode, e.Hash, e.Stage, e.Path)
+			out.printf("%06o %s %d\t%s\n", e.Mode, e.Hash, e.Stage, quote.Path(e.Path))
 		} else {
-			out.printf("%s\n", e.Path)
+			out.printf("%s\n", quote.Path(e.Path))
 		}
 	}
 	return nil
@@ -182,17 +184,17 @@ func runStatus(args []string, out *output) error {
 	if *short {
 		printShortStatus(out, res)
 	} else {
-		printLongStatus(out, res)
+		printLongStatus(r, out, res)
 	}
 	return nil
 }
 
 func printShortStatus(out *output, res *status.Result) {
 	for _, c := range res.Changes {
-		out.printf("%c%c %s\n", c.Staged, c.Unstaged, c.Path)
+		out.printf("%c%c %s\n", c.Staged, c.Unstaged, quote.PathWithSpaces(c.Path))
 	}
 	for _, p := range res.Untracked {
-		out.printf("?? %s\n", p)
+		out.printf("?? %s\n", quote.PathWithSpaces(p))
 	}
 }
 
@@ -211,11 +213,11 @@ func label(code byte) string {
 	return ""
 }
 
-func printLongStatus(out *output, res *status.Result) {
+func printLongStatus(r *repo.Repo, out *output, res *status.Result) {
 	if res.Head.Branch != "" {
 		out.printf("On branch %s\n", res.Head.Branch)
 	} else {
-		out.printf("HEAD detached at %s\n", res.Head.Commit.String()[:7])
+		out.printf("HEAD detached at %s\n", r.Objects.Abbrev(res.Head.Commit, 7))
 	}
 	if !res.Head.HasCommit {
 		out.printf("\nNo commits yet\n")
@@ -224,16 +226,20 @@ func printLongStatus(out *output, res *status.Result) {
 	unstaged := make([]string, 0, len(res.Changes))
 	for _, c := range res.Changes {
 		if c.Staged != status.Unchanged {
-			staged = append(staged, label(c.Staged)+c.Path)
+			staged = append(staged, label(c.Staged)+quote.Path(c.Path))
 		}
 		if c.Unstaged != status.Unchanged {
-			unstaged = append(unstaged, label(c.Unstaged)+c.Path)
+			unstaged = append(unstaged, label(c.Unstaged)+quote.Path(c.Path))
 		}
+	}
+	untracked := make([]string, len(res.Untracked))
+	for i, p := range res.Untracked {
+		untracked[i] = quote.Path(p)
 	}
 	printSection(out, "Changes to be committed:", "these will go into the next commit", staged)
 	printSection(out, "Changes not staged for commit:", `use "mgit add <file>..." to stage them`, unstaged)
-	printSection(out, "Untracked files:", `use "mgit add <file>..." to start tracking them`, res.Untracked)
-	if len(staged)+len(unstaged)+len(res.Untracked) == 0 {
+	printSection(out, "Untracked files:", `use "mgit add <file>..." to start tracking them`, untracked)
+	if len(staged)+len(unstaged)+len(untracked) == 0 {
 		out.printf("\nnothing to commit, working tree clean\n")
 	}
 }

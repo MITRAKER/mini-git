@@ -5,7 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/MITRAKER/mini-git/internal/history"
 	"github.com/MITRAKER/mini-git/internal/index"
 	"github.com/MITRAKER/mini-git/internal/object"
 	"github.com/MITRAKER/mini-git/internal/repo"
@@ -131,5 +133,89 @@ func TestDeletedAndSwappedPaths(t *testing.T) {
 	// tracked file's name is not listed.
 	if got := strings.Join(res.Untracked, ","); got != "was-folder" {
 		t.Errorf("untracked = %q, want was-folder", got)
+	}
+}
+
+// racyIndex writes an index in which "same" matches its file and "edited"
+// was changed again right after it was staged: its entry has the file's
+// stat information but the hash of the first version. The index file gets
+// the files' time, so both entries are racily clean.
+func racyIndex(t *testing.T, r *repo.Repo) {
+	t.Helper()
+	writeFile(t, r, "same", "one\n")
+	writeFile(t, r, "edited", "two\n")
+	ix := &index.Index{}
+	stage(t, r, ix, "same")
+	fi, err := os.Lstat(r.AbsPath("edited"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Set(index.NewEntry("edited", fi, object.Compute(object.Blob, []byte("one\n")))); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Write(r.IndexPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(r.IndexPath(), fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readIndex(t *testing.T, r *repo.Repo) *index.Index {
+	t.Helper()
+	ix, err := index.Read(r.IndexPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ix
+}
+
+func unstaged(t *testing.T, r *repo.Repo, ix *index.Index) string {
+	t.Helper()
+	changes, err := diff(r, ix, map[string]history.File{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var codes strings.Builder
+	for _, c := range changes {
+		codes.WriteString(string(c.Unstaged) + c.Path + " ")
+	}
+	return codes.String()
+}
+
+// The stat information of a racily clean entry is not trusted: status reads
+// the file, and sees the second edit.
+func TestStatusReadsRacyFiles(t *testing.T) {
+	r := newRepo(t)
+	racyIndex(t, r)
+	if got := unstaged(t, r, readIndex(t, r)); got != "Medited  same " {
+		t.Errorf("unstaged changes: %q", got)
+	}
+}
+
+// CheckRacy smudges the entry whose file changed, so that the change is
+// still seen after the index is written again (when the entry is no longer
+// racy), and leaves the other entry as it was.
+func TestCheckRacySmudgesChangedFiles(t *testing.T) {
+	r := newRepo(t)
+	racyIndex(t, r)
+	ix := readIndex(t, r)
+	CheckRacy(r, ix)
+	if err := ix.Write(r.IndexPath()); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour) // the files are now older than the index
+	if err := os.Chtimes(r.IndexPath(), later, later); err != nil {
+		t.Fatal(err)
+	}
+	again := readIndex(t, r)
+	if e := again.Get("edited"); e.Size != 0 {
+		t.Errorf("edited: size %d, want 0 (smudged)", e.Size)
+	}
+	if e := again.Get("same"); e.Size != 4 {
+		t.Errorf("same: size %d, want 4", e.Size)
+	}
+	if got := unstaged(t, r, again); got != "Medited  same " {
+		t.Errorf("unstaged changes: %q", got)
 	}
 }

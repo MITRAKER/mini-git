@@ -1,6 +1,8 @@
 package revision
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -189,5 +191,65 @@ func TestPeelFollowsTagChainsWithALimit(t *testing.T) {
 	}
 	if _, err := peelTags(h.r, target); err == nil {
 		t.Error("peelTags followed more tags than its limit")
+	}
+}
+
+// writeRefFile writes a ref file as it is, even one that holds garbage.
+func writeRefFile(t *testing.T, r *repo.Repo, ref, content string) {
+	t.Helper()
+	p := filepath.Join(r.GitDir, filepath.FromSlash(ref))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Like Git, a broken ref file is skipped when a name is looked up: an empty
+// refs/heads/v1 must not hide the tag v1, or count as a second match.
+func TestBrokenRefsAreSkipped(t *testing.T) {
+	h := newHistory(t)
+	writeRefFile(t, h.r, "refs/heads/v1", "")
+	writeRefFile(t, h.r, "refs/heads/v3", "garbage\n")
+	got, err := Resolve(h.r, "v1")
+	if err != nil || got != h.first {
+		t.Errorf("Resolve(v1) = %s, %v; want %s", got, err, h.first)
+	}
+	if n, err := RefMatches(h.r, "v1"); err != nil || n != 1 {
+		t.Errorf("RefMatches(v1) = %d, %v; want 1", n, err)
+	}
+	if _, err := Resolve(h.r, "v3"); err == nil {
+		t.Error("Resolve(v3), a broken ref and nothing else, succeeded")
+	}
+}
+
+func TestShortRefName(t *testing.T) {
+	h := newHistory(t)
+	mustRef(t, h.r, "refs/heads/topic", h.first)
+	mustRef(t, h.r, "refs/tags/topic", h.first) // a tag with a branch's name
+	mustRef(t, h.r, "refs/remotes/origin/main", h.first)
+	writeRefFile(t, h.r, "refs/remotes/origin/HEAD", "ref: refs/remotes/origin/main\n")
+	mustRef(t, h.r, "refs/heads/heads/x", h.first)
+	mustRef(t, h.r, "refs/heads/x", h.first)
+	writeRefFile(t, h.r, "refs/tags/broken", "garbage\n")
+	mustRef(t, h.r, "refs/heads/broken", h.first)
+	for full, want := range map[string]string{
+		"refs/heads/main":          "main",
+		"refs/tags/v1":             "v1",
+		"refs/heads/topic":         "heads/topic", // "topic" would mean the tag
+		"refs/tags/topic":          "tags/topic",
+		"refs/remotes/origin/main": "origin/main",
+		"refs/remotes/origin/HEAD": "origin", // origin's default branch
+		"refs/heads/x":             "x",
+		"refs/heads/heads/x":       "heads/heads/x", // "heads/x" would mean refs/heads/x
+		"refs/heads/broken":        "broken",        // the broken tag does not count
+		"refs/heads/nosuch":        "nosuch",
+		"refs/other/thing":         "other/thing",
+		"HEAD":                     "HEAD",
+	} {
+		if got := ShortRefName(h.r, full); got != want {
+			t.Errorf("ShortRefName(%s) = %q, want %q", full, got, want)
+		}
 	}
 }

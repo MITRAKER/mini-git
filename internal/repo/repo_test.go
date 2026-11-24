@@ -259,4 +259,100 @@ func TestHead(t *testing.T) {
 	if err != nil || head.Branch != "" || !head.HasCommit || head.Commit != h {
 		t.Errorf("detached HEAD: %+v, %v", head, err)
 	}
+	if chain, err := r.HeadChain(); err != nil || len(chain) != 0 {
+		t.Errorf("detached HEAD: chain %v, %v", chain, err)
+	}
+}
+
+// Many repositories keep refs/heads/master as a symbolic ref to
+// refs/heads/main. With HEAD on master, the current branch is main, as for
+// Git: a commit must move main, not turn master into a plain branch.
+func TestHeadThroughASymbolicBranch(t *testing.T) {
+	r := newTestRepo(t)
+	h := object.Compute(object.Blob, []byte("x"))
+	write(t, gitFile(r, "refs/heads/main"), h.String()+"\n")
+	write(t, gitFile(r, "refs/heads/master"), "ref: refs/heads/main\n")
+	write(t, filepath.Join(r.GitDir, "HEAD"), "ref: refs/heads/master\n")
+	head, err := r.Head()
+	if err != nil || head.Branch != "main" || !head.HasCommit || head.Commit != h {
+		t.Errorf("Head() = %+v, %v; want main at %s", head, err, h)
+	}
+	target, err := r.HeadTarget()
+	if err != nil || target != "refs/heads/main" {
+		t.Errorf("HeadTarget() = %q, %v", target, err)
+	}
+	chain, err := r.HeadChain()
+	if want := []string{"refs/heads/master", "refs/heads/main"}; err != nil || strings.Join(chain, " ") != strings.Join(want, " ") {
+		t.Errorf("HeadChain() = %v, %v; want %v", chain, err, want)
+	}
+	// An unborn branch at the end of the links: no commit yet.
+	write(t, gitFile(r, "refs/heads/master"), "ref: refs/heads/new\n")
+	head, err = r.Head()
+	if err != nil || head.Branch != "new" || head.HasCommit {
+		t.Errorf("Head() through an unborn branch = %+v, %v", head, err)
+	}
+	write(t, gitFile(r, "refs/heads/master"), "ref: refs/heads/master\n")
+	if _, err := r.Head(); err == nil {
+		t.Error("Head() through a loop succeeded")
+	}
+	if _, err := r.HeadChain(); err == nil {
+		t.Error("HeadChain() through a loop succeeded")
+	}
+}
+
+// Git once kept HEAD as a symbolic link to the branch file, and still does
+// with core.preferSymlinkRefs. A link that names a ref is a symbolic ref,
+// even when no file is there (the branch is packed). Any other link is
+// followed to the file it leads to.
+func TestSymlinkedRefs(t *testing.T) {
+	r := newTestRepo(t)
+	h := object.Compute(object.Blob, []byte("x"))
+	write(t, gitFile(r, "refs/heads/main"), h.String()+"\n")
+	write(t, filepath.Join(r.GitDir, "packed-refs"), "# pack-refs with: peeled fully-peeled sorted \n"+h.String()+" refs/heads/packed\n")
+	head := filepath.Join(r.GitDir, "HEAD")
+	link := func(target, p string) {
+		t.Helper()
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, branch := range []string{"main", "packed"} {
+		link("refs/heads/"+branch, head)
+		if got, err := r.Head(); err != nil || got.Branch != branch || !got.HasCommit || got.Commit != h {
+			t.Errorf("HEAD -> refs/heads/%s: %+v, %v", branch, got, err)
+		}
+		if chain, err := r.HeadChain(); err != nil || strings.Join(chain, " ") != "refs/heads/"+branch {
+			t.Errorf("HEAD -> refs/heads/%s: chain %v, %v", branch, chain, err)
+		}
+	}
+	// A link to a path is followed: this file holds a hash, so HEAD is
+	// detached.
+	elsewhere := filepath.Join(r.WorkTree, "elsewhere")
+	write(t, elsewhere, h.String()+"\n")
+	link(elsewhere, head)
+	if target, err := r.HeadTarget(); err != nil || target != "HEAD" {
+		t.Errorf("HEAD -> %s: target %q, %v; want HEAD", elsewhere, target, err)
+	}
+	// A branch can be such a link too.
+	link("refs/heads/main", gitFile(r, "refs/heads/alias"))
+	if target, ok, err := r.SymrefTarget("refs/heads/alias"); err != nil || !ok || target != "refs/heads/main" {
+		t.Errorf("SymrefTarget(alias) = %q, %v, %v", target, ok, err)
+	}
+	if got, ok, err := r.ResolveRef("refs/heads/alias"); err != nil || !ok || got != h {
+		t.Errorf("ResolveRef(alias) = %s, %v, %v; want %s", got, ok, err, h)
+	}
+}
+
+// In a linked worktree or a submodule, .git is a file. mgit cannot follow
+// it, and must not climb past it to a repository further up either.
+func TestFindRefusesAGitFile(t *testing.T) {
+	r := newTestRepo(t)
+	inner := filepath.Join(r.WorkTree, "linked")
+	write(t, filepath.Join(inner, ".git"), "gitdir: "+filepath.Join(r.GitDir, "worktrees", "linked")+"\n")
+	if found, err := Find(inner); err == nil || !strings.Contains(err.Error(), "is a file") {
+		t.Errorf("Find(linked worktree) = %+v, %v; want an error", found, err)
+	}
 }

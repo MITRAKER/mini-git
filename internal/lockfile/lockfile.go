@@ -49,6 +49,9 @@ func (l *Lock) Write(b []byte) error {
 	return err
 }
 
+// Stat describes the lock file, with what has been written so far.
+func (l *Lock) Stat() (os.FileInfo, error) { return l.file.Stat() }
+
 // Commit closes the lock file and renames it over the target, publishing the
 // new contents.
 func (l *Lock) Commit() error {

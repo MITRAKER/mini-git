@@ -25,6 +25,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/MITRAKER/mini-git/internal/bounded"
 	"github.com/MITRAKER/mini-git/internal/lockfile"
@@ -51,6 +52,11 @@ type Entry struct {
 	Hash                object.Hash
 	Stage               uint16 // 0 normally; 1-3 during a merge conflict
 	Path                string // repository path with forward slashes
+
+	// checked is true when this run of mgit made the entry from the file
+	// itself, or compared the file's contents with it (see CheckRacy): it
+	// is never racily clean. It is not stored in the index file.
+	checked bool
 }
 
 // typeMask selects the kind of file from a mode: regular file, symbolic link
@@ -62,12 +68,14 @@ const typeMask uint32 = 0o170000
 // the executable bit alone does not count.
 func SameKind(a, b uint32) bool { return a&typeMask == b&typeMask }
 
-// ModeOf returns the mode Git records for a file.
+// ModeOf returns the mode Git records for a file. Like Git, it looks only at
+// the owner's execute bit: a file that only its group or others may run
+// (chmod 645) is not executable.
 func ModeOf(fi os.FileInfo) uint32 {
 	switch {
 	case fi.Mode()&os.ModeSymlink != 0:
 		return ModeSymlink
-	case fi.Mode().Perm()&0o111 != 0:
+	case fi.Mode().Perm()&0o100 != 0:
 		return ModeExecutable
 	default:
 		return ModeFile
@@ -75,8 +83,10 @@ func ModeOf(fi os.FileInfo) uint32 {
 }
 
 // NewEntry builds an entry for path from its stat information and blob hash.
+// Call it right after reading or writing the file, with the hash of what was
+// read or written.
 func NewEntry(path string, fi os.FileInfo, h object.Hash) *Entry {
-	e := &Entry{Path: path, Hash: h, Mode: ModeOf(fi), Size: low32(fi.Size())}
+	e := &Entry{Path: path, Hash: h, Mode: ModeOf(fi), Size: low32(fi.Size()), checked: true}
 	fillStat(e, fi) // platform-specific: see stat_*.go
 	return e
 }
@@ -93,18 +103,49 @@ func low32u(v uint64) uint32 {
 	return uint32(v & 0xFFFF_FFFF) // the index format keeps the low 32 bits
 }
 
-// StatMatches reports whether the file on disk still has the size, mode and
-// modification time recorded in the entry. If so, Git assumes the contents are
-// unchanged and skips hashing the file.
+// StatMatches reports whether the file on disk still has the stat
+// information recorded in the entry: its kind and executable bit, its size,
+// when its contents and its metadata last changed, its inode and its owner.
+// These are the fields Git compares (all but the device number, which
+// changes on network file systems). Writing to a file changes its ctime,
+// and nobody can set that back, so an edit is noticed even when the old
+// modification time is put back (touch -r).
+//
+// An entry with size 0 whose blob is not empty never matches: Git and mgit
+// "smudge" an entry that way to record that its file changed (see Smudge).
+//
+// A match is not enough to trust the file, see Index.UpToDate.
 func (e *Entry) StatMatches(fi os.FileInfo) bool {
 	fresh := NewEntry(e.Path, fi, e.Hash)
-	return fresh.Size == e.Size && fresh.Mode == e.Mode &&
-		fresh.MtimeSec == e.MtimeSec && fresh.MtimeNsec == e.MtimeNsec
+	return fresh.Mode == e.Mode && fresh.Size == e.Size &&
+		fresh.MtimeSec == e.MtimeSec && fresh.MtimeNsec == e.MtimeNsec &&
+		fresh.CtimeSec == e.CtimeSec && fresh.CtimeNsec == e.CtimeNsec &&
+		fresh.Ino == e.Ino && fresh.UID == e.UID && fresh.GID == e.GID &&
+		!e.smudged()
 }
+
+func (e *Entry) smudged() bool {
+	return e.Size == 0 && e.Hash != object.Compute(object.Blob, nil) // the hash of an empty file
+}
+
+// Smudge records that the entry's file has changed although its stat
+// information still matches: its size becomes 0, which StatMatches never
+// accepts for a file that is not empty. Git does the same.
+func (e *Entry) Smudge() { e.Size = 0 }
+
+// MarkChecked records that the file's contents were just compared with the
+// entry and are the same, so the entry is not racily clean (see Racy).
+func (e *Entry) MarkChecked() { e.checked = true }
 
 // Index is the whole staging area. Entries are kept sorted by path.
 type Index struct {
 	Entries []*Entry
+
+	// existed is true when the index was read from a file, and stampSec
+	// and stampNsec are then the file's modification time (see Racy). They
+	// are updated when the index is written.
+	existed             bool
+	stampSec, stampNsec uint32
 }
 
 const (
@@ -123,16 +164,82 @@ const (
 )
 
 // Read loads the index at path. A missing file is an empty index, which is
-// what a brand new repository has.
+// what a brand new repository has (see Unborn).
 func Read(path string) (*Index, error) {
-	data, err := bounded.ReadFile(path, object.MaxSize)
+	data, fi, err := readWithStat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return &Index{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return Parse(data)
+	ix, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	ix.setStamp(fi.ModTime())
+	return ix, nil
+}
+
+// readWithStat reads the file at path, and describes the file it read: its
+// time is right even if the file is replaced meanwhile.
+func readWithStat(path string) ([]byte, os.FileInfo, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	fi, err := f.Stat()
+	var data []byte
+	if err == nil {
+		data, err = bounded.ReadAll(f, object.MaxSize, path)
+	}
+	return data, fi, errors.Join(err, f.Close())
+}
+
+// setStamp records the modification time of the index file.
+func (ix *Index) setStamp(t time.Time) {
+	ix.existed = true
+	ix.stampSec, ix.stampNsec = low32(t.Unix()), low32(int64(t.Nanosecond()))
+}
+
+// Unborn reports whether there is no index at all: no file was read, and no
+// entry added. That is the case right after `git clone --no-checkout`, and
+// Git then checks the files out as if none were tracked (see package
+// checkout). An index file with no entries is not unborn.
+func (ix *Index) Unborn() bool { return !ix.existed && len(ix.Entries) == 0 }
+
+// Racy reports whether e is "racily clean": its file was last changed at
+// the same time as the index file was written, or later. A file can be
+// changed twice within one tick of the clock, and the second change then
+// leaves its stat information as it was; if the index was written within
+// that tick, the entry records the first change and still matches. So for
+// such an entry a match proves nothing, and the contents must be compared.
+// An entry made or checked by this run of mgit is not racy.
+func (ix *Index) Racy(e *Entry) bool {
+	return !e.checked && ix.racyStamp(e)
+}
+
+// racyStamp is Racy's comparison of the times.
+func (ix *Index) racyStamp(e *Entry) bool {
+	return ix.existed && (ix.stampSec < e.MtimeSec ||
+		(ix.stampSec == e.MtimeSec && ix.stampNsec <= e.MtimeNsec))
+}
+
+// UpToDate reports whether the file described by fi can be taken to hold
+// the contents e records, without reading it: its stat information matches
+// e (StatMatches), and e is not racily clean. When it returns false, the
+// file must be read and hashed to know whether it changed.
+func (ix *Index) UpToDate(e *Entry, fi os.FileInfo) bool {
+	return e.StatMatches(fi) && !ix.racyStamp(e)
+}
+
+// Derive returns a new index holding entries, which remembers when ix was
+// read: an entry it keeps from ix stays racily clean if it was. Git builds
+// the index of a checkout the same way.
+func (ix *Index) Derive(entries []*Entry) *Index {
+	nu := New(entries)
+	nu.existed, nu.stampSec, nu.stampNsec = ix.existed, ix.stampSec, ix.stampNsec
+	return nu
 }
 
 // Parse decodes the bytes of an index file and checks everything it reads:
@@ -215,7 +322,7 @@ func parseEntry(b []byte) (*Entry, int, error) {
 		return nil, 0, errors.New("path has no terminator")
 	}
 	e.Path = string(b[nameStart : nameStart+nul])
-	if err := CheckPath(e.Path); err != nil {
+	if err := CheckPath(e.Path, e.Mode); err != nil {
 		return nil, 0, err
 	}
 	size := paddedLen(nameStart + len(e.Path))
@@ -229,44 +336,71 @@ func parseEntry(b []byte) (*Entry, int, error) {
 // least one NUL, which also terminates the path.
 func paddedLen(n int) int { return (n + 8) &^ 7 }
 
-// maxPathLen is the longest path mgit accepts (Linux's PATH_MAX).
-const maxPathLen = 4096
-
-// CheckPath rejects paths that must never be tracked, because writing them
-// to disk later could escape the working tree or overwrite the repository
-// itself: empty paths, absolute paths, "." or ".." parts, empty parts ("a//b"),
-// and any part named ".git" (in any letter case).
-func CheckPath(p string) error {
-	if p == "" || len(p) > maxPathLen {
-		return fmt.Errorf("invalid path %q: empty or longer than %d bytes", p, maxPathLen)
-	}
-	if strings.ContainsRune(p, 0) {
-		return fmt.Errorf("invalid path %q: contains NUL", p)
-	}
-	for _, part := range strings.Split(p, "/") {
-		if part == "" || part == "." || part == ".." || strings.EqualFold(part, ".git") {
-			return fmt.Errorf("invalid path %q: %q is not allowed as a path part", p, part)
-		}
-	}
-	return nil
+// New returns an index holding entries, sorted into index order.
+func New(entries []*Entry) *Index {
+	ix := &Index{Entries: entries}
+	ix.sort()
+	return ix
 }
 
 // Write saves the index to path through a lock file (see package lockfile),
 // so readers never see a half-written index and two commands running at once
 // cannot both write it.
 func (ix *Index) Write(path string) error {
-	data, err := ix.Encode()
-	if err != nil {
-		return err
-	}
 	lock, err := lockfile.Acquire(path)
 	if err != nil {
 		return err
 	}
-	if err := lock.Write(data); err != nil {
+	return ix.CommitLocked(lock)
+}
+
+// ReadLocked takes the index's lock and then reads the index. A command that
+// changes the working tree before it writes the index (such as checkout)
+// holds the lock the whole time, so no other command can change the index
+// in between. Finish with CommitLocked, or with the lock's Rollback.
+func ReadLocked(path string) (*Index, *lockfile.Lock, error) {
+	lock, err := lockfile.Acquire(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	ix, err := Read(path)
+	if err != nil {
+		return nil, nil, errors.Join(err, lock.Rollback())
+	}
+	return ix, lock, nil
+}
+
+// CommitLocked writes the index through a lock taken by ReadLocked (or
+// Write), and releases the lock.
+//
+// A racily clean entry (see Racy) would stop being racy once the index
+// file is newer than it, though its file may have changed. So, as Git does,
+// it is smudged first (see Smudge): its size is set to 0, and a later
+// command reads the file. Commands that can compare the files first should
+// do so (status.CheckRacy), so that only entries whose files really changed
+// are smudged.
+func (ix *Index) CommitLocked(lock *lockfile.Lock) error {
+	for _, e := range ix.Entries {
+		if ix.Racy(e) {
+			e.Smudge()
+		}
+	}
+	data, err := ix.Encode()
+	if err == nil {
+		err = lock.Write(data)
+	}
+	var fi os.FileInfo
+	if err == nil {
+		fi, err = lock.Stat()
+	}
+	if err != nil {
 		return errors.Join(err, lock.Rollback())
 	}
-	return lock.Commit()
+	if err := lock.Commit(); err != nil {
+		return err
+	}
+	ix.setStamp(fi.ModTime()) // renaming the file keeps its time
+	return nil
 }
 
 // Encode returns the bytes of the index file. It refuses to encode an index
@@ -279,7 +413,7 @@ func (ix *Index) Encode() ([]byte, error) {
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(ix.Entries))) //nolint:gosec // G115: bounded by memory, far below 2^32 entries
 
 	for i, e := range ix.Entries {
-		if err := CheckPath(e.Path); err != nil {
+		if err := CheckPath(e.Path, e.Mode); err != nil {
 			return nil, err
 		}
 		if e.Stage > maxStage {
@@ -354,7 +488,7 @@ func (ix *Index) Get(path string) *Entry {
 // drops entries that would clash with the new one: a file "a" cannot be
 // tracked next to files inside a directory "a/".
 func (ix *Index) Set(e *Entry) error {
-	if err := CheckPath(e.Path); err != nil {
+	if err := CheckPath(e.Path, e.Mode); err != nil {
 		return err
 	}
 	ix.RemoveUnder(e.Path + "/")

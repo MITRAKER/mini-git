@@ -20,6 +20,8 @@ Everyday commands ("porcelain"):
   status       show staged, unstaged and untracked changes
   commit       save the staged files as a new commit
   log          show the commit history
+  branch       list, create or delete branches
+  checkout     switch branches, or look at an old commit
   version      print mgit's version
 
 Building blocks ("plumbing"):
@@ -82,6 +84,10 @@ func dispatch(name string, args []string, out *output) (known bool, err error) {
 		return true, runCommit(args, out)
 	case "log":
 		return true, runLog(args, out)
+	case "branch":
+		return true, runBranch(args, out)
+	case "checkout":
+		return true, runCheckout(args, out)
 	}
 	return dispatchPlumbing(name, args, out)
 }

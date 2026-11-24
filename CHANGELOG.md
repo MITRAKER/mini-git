@@ -31,6 +31,14 @@ changes.
   - FIFOs, sockets and devices in the working tree are skipped like git
     skips them, and never opened: `add` and `status` used to wait forever on
     a FIFO.
+  - The stat check compares what git compares: size, modification and
+    change times, inode, owner and mode. An edit is noticed even when the
+    old modification time is put back. Files changed in the same clock tick
+    as the index ("racy git") are read again, and their entries smudged
+    before the index is written, as git does. Only the owner's execute bit
+    makes a file executable, as in git.
+  - File names are quoted as git quotes them (`core.quotePath`) in `status`,
+    `ls-files`, `cat-file -p` of a tree and checkout's list of changes.
 - **History**
   - `commit` (`-m`, `-F`, `-a`, `--allow-empty`), `write-tree`, `commit-tree`,
     `log` (`--oneline`, `-n <number>` or `-<number>`, and revisions to start
@@ -42,12 +50,62 @@ changes.
     `user.email` in git config.
   - Commits are byte-for-byte identical to git's: the same files, identity,
     date and message give the same commit hash.
+- **Branches**
+  - `branch`: list the branches (`*` marks the current one, `+` one
+    checked out in another worktree, and a detached HEAD is shown as
+    `(HEAD detached at <commit>)`, or as the rebase or bisect in progress),
+    create one at HEAD or at any revision, and delete with `-d` (only when
+    merged into HEAD) or `-D`.
+  - `checkout <branch>`, `checkout <commit>` (a detached HEAD) and
+    `checkout -b <new> [<start>]`. Uncommitted changes come along when both
+    commits agree on those files; otherwise checkout refuses, naming the
+    files, and nothing changes. Untracked files and folders in the way stop
+    it too, with git's messages.
+  - Leaving a detached HEAD warns about the commits no branch or tag holds,
+    as git does.
+  - With no index at all (after `git clone --no-checkout`), checkout writes
+    every file of the new commit, as git does. It never removes the folder
+    it runs in.
+  - HEAD may point to a symbolic branch, such as `master` linked to `main`:
+    as in git, the current branch is the one at the end of the links, which
+    a commit moves and which cannot be deleted. When the links lead out of
+    `refs/heads`, `branch` stops with git's `HEAD not found below
+    refs/heads!`.
+  - A HEAD or a branch stored as a symbolic link to a ref name, as old git
+    and `core.preferSymlinkRefs` write it, is read as a symbolic ref, as git
+    reads it. HEAD used to look detached: a commit then left the branch
+    behind, and `branch -d` could delete the current branch.
+  - `branch <new>` with no start point starts from the current branch by
+    name, as git does, so a tag with the same name makes it ambiguous and
+    it is refused.
+  - A branch that another worktree has checked out, or that a rebase, a
+    bisect or `rebase --update-refs` will come back to, cannot be deleted,
+    and checkout refuses a branch checked out in another worktree, as git
+    does. mgit refuses to run inside a linked worktree or a submodule, where
+    `.git` is a file.
+  - Refs in `.git/packed-refs` are read, and removed when a branch (or a
+    symbolic ref that hides a packed branch) is deleted. Broken refs, and
+    refs with names git no longer accepts, are skipped with git's warnings,
+    and a broken ref never hides another ref with the same short name.
+    Symbolic refs are listed as `name -> target`, with the target at the
+    end of the links, as short as git makes it.
+  - Paths that some file system would open as `.git` (`.GIT`, `.git.`,
+    `git~1`, `.git::$INDEX_ALLOCATION`, or `.git` with invisible Unicode
+    characters for macOS), and a symbolic link named `.gitmodules`, are
+    never written or tracked, as in git.
+  - Checkout never writes through a symbolic link: it checks every folder
+    above a path, and creates files with `O_EXCL`.
+  - If a file cannot be written half-way through a switch (a full disk, for
+    example), checkout finishes the rest as git does, names the file, and
+    exits with status 1; `status` then shows that file as modified.
 - **Robustness**
   - Every file mgit reads, and standard input, has a size limit, and an
     object's header is checked before memory is allocated for it. A corrupt
     or hostile repository gives an error instead of using up the memory.
   - An object file with extra bytes after its compressed data is reported as
     corrupt, as git does.
+  - Old file modes in trees, such as `100664`, are read as git reads them
+    (`100644`).
   - Trees, folders and history are walked with loops that have fixed limits,
     never with recursion, so deeply nested or looping data (such as symbolic
     refs that point to each other) gives an error instead of a hang or a
@@ -79,7 +137,7 @@ changes.
   - Issue forms, a pull request template, a contributing guide, a security
     policy and a code of conduct.
 - **Learning**
-  - `LEARNING.md` with lessons 0 to 4: one lesson per build step, explaining
+  - `LEARNING.md` with lessons 0 to 5: one lesson per build step, explaining
     how and why each part was built.
 
 [Unreleased]: https://github.com/MITRAKER/mini-git/commits/main
