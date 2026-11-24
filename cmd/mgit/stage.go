@@ -27,7 +27,7 @@ func runAdd(args []string) error {
 	if len(args) == 0 {
 		return errors.New("nothing specified, nothing added (try 'mgit add .')")
 	}
-	r, err := findRepo()
+	r, err := findWorkTree()
 	if err != nil {
 		return err
 	}
@@ -169,21 +169,36 @@ func addDir(r *repo.Repo, ix *index.Index, rel string) (bool, error) {
 	return at.matched+added == 0 && at.sparse > 0, nil
 }
 
-// forgetDeleted removes the entries whose files are no longer on disk.
+// forgetDeleted removes the entries whose files are no longer on disk. A
+// submodule that is not checked out is not deleted (status.Missing).
 func forgetDeleted(r *repo.Repo, ix *index.Index, entries []*index.Entry) error {
 	for _, e := range entries {
 		fi, found, err := r.StatTracked(e.Path)
-		switch {
-		case err != nil:
+		if err != nil {
 			return err
+		}
+		switch {
 		case !found:
-			ix.Remove(e.Path)
+			gone, err := deleted(r, e)
+			if err != nil {
+				return err
+			}
+			if gone {
+				ix.Remove(e.Path)
+			}
 		case !repo.IsFileOrLink(fi.Mode()):
 			// ListFiles skips special files, so say why this one is not added.
 			return fmt.Errorf("%s: can only add regular files and symbolic links", e.Path)
 		}
 	}
 	return nil
+}
+
+// deleted reports whether the file of e, which StatTracked did not find,
+// counts as deleted: not when it is a submodule that is not checked out.
+func deleted(r *repo.Repo, e *index.Entry) (bool, error) {
+	unchanged, err := status.Missing(r, e)
+	return !unchanged, err
 }
 
 // mgit ls-files [-s]
@@ -219,7 +234,7 @@ func runStatus(args []string, out *output) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	r, err := findRepo()
+	r, err := findWorkTree()
 	if err != nil {
 		return err
 	}

@@ -28,35 +28,56 @@ import (
 	"github.com/MITRAKER/mini-git/internal/index"
 	"github.com/MITRAKER/mini-git/internal/object"
 	"github.com/MITRAKER/mini-git/internal/repo"
+	"github.com/MITRAKER/mini-git/internal/status"
 )
 
-// Pathspec limits a diff to some paths: each is a file, or a folder and
-// everything in it ("" is the whole project). An empty Pathspec matches
-// every path.
+// Pathspec limits a diff to some paths. Each is a file, or a folder and
+// everything in it; "" is the whole project. A path that ends with "/"
+// names a folder only: "d/" matches the files in d, but not a file or a
+// symbolic link named d. (A submodule is a folder: "d/" matches a
+// submodule named d.) An empty Pathspec matches every path.
 type Pathspec []string
 
-// Matches reports whether path is one of the paths, or inside one.
-func (ps Pathspec) Matches(path string) bool {
+// Matches reports whether ps matches the file at path, whose mode is mode.
+func (ps Pathspec) Matches(path string, mode uint32) bool {
 	if len(ps) == 0 {
 		return true
 	}
 	for _, p := range ps {
-		if p == "" || path == p || strings.HasPrefix(path, p+"/") {
+		dir, folderOnly := strings.CutSuffix(p, "/")
+		switch {
+		case p == "" || strings.HasPrefix(path, dir+"/"):
+			return true
+		case path == dir && (!folderOnly || mode == index.ModeSubmodule):
 			return true
 		}
 	}
 	return false
 }
 
+// filter returns the files of a snapshot that ps matches.
+func (ps Pathspec) filter(files map[string]history.File) map[string]history.File {
+	if len(ps) == 0 {
+		return files
+	}
+	kept := make(map[string]history.File, len(files))
+	for p, f := range files {
+		if ps.Matches(p, f.Mode) {
+			kept[p] = f
+		}
+	}
+	return kept
+}
+
 // Compare compares two snapshots kept as lists of files, such as a
 // commit's tree (history.CommitFiles) or the index (IndexFiles), and
-// returns the files that differ, sorted by path.
+// returns the files that differ, sorted by path. Like Git, it picks the
+// files ps matches in each snapshot on its own: "d/" can match a
+// submodule d on one side and not a file d on the other.
 func Compare(before, after map[string]history.File, ps Pathspec) []Pair {
+	before, after = ps.filter(before), ps.filter(after)
 	var pairs []Pair
 	for p, f := range before {
-		if !ps.Matches(p) {
-			continue
-		}
 		g, ok := after[p]
 		switch {
 		case !ok:
@@ -66,7 +87,7 @@ func Compare(before, after map[string]history.File, ps Pathspec) []Pair {
 		}
 	}
 	for p, g := range after {
-		if _, ok := before[p]; !ok && ps.Matches(p) {
+		if _, ok := before[p]; !ok {
 			pairs = append(pairs, Pair{Path: p, New: stored(g)})
 		}
 	}
@@ -79,7 +100,7 @@ func Compare(before, after map[string]history.File, ps Pathspec) []Pair {
 func IndexFiles(ix *index.Index, ps Pathspec) (map[string]history.File, error) {
 	files := make(map[string]history.File, len(ix.Entries))
 	for _, e := range ix.Entries {
-		if !ps.Matches(e.Path) || e.IntentToAdd {
+		if !ps.Matches(e.Path, e.Mode) || e.IntentToAdd {
 			continue
 		}
 		if e.Stage != 0 {
@@ -97,7 +118,7 @@ func IndexFiles(ix *index.Index, ps Pathspec) (map[string]history.File, error) {
 func IndexToWorktree(r *repo.Repo, ix *index.Index, ps Pathspec) ([]Pair, error) {
 	var pairs []Pair
 	for _, e := range ix.Entries {
-		if !ps.Matches(e.Path) {
+		if !ps.Matches(e.Path, e.Mode) {
 			continue
 		}
 		if e.Stage != 0 {
@@ -129,7 +150,7 @@ func TreeToWorktree(r *repo.Repo, ix *index.Index, tree map[string]history.File,
 	var pairs []Pair
 	tracked := make(map[string]bool, len(ix.Entries))
 	for _, e := range ix.Entries {
-		if !ps.Matches(e.Path) {
+		if !ps.Matches(e.Path, e.Mode) {
 			continue
 		}
 		if e.Stage != 0 {
@@ -146,7 +167,7 @@ func TreeToWorktree(r *repo.Repo, ix *index.Index, tree map[string]history.File,
 		}
 	}
 	for p, f := range tree {
-		if !tracked[p] && ps.Matches(p) {
+		if !tracked[p] && ps.Matches(p, f.Mode) {
 			pairs = append(pairs, Pair{Path: p, Old: stored(f)})
 		}
 	}
@@ -185,8 +206,15 @@ func treePair(path string, f history.File, inTree bool, w Side) Pair {
 func worktreeSide(r *repo.Repo, ix *index.Index, e *index.Entry) (Side, error) {
 	fi, found, err := r.StatTracked(e.Path)
 	switch {
-	case err != nil || !found:
+	case err != nil:
 		return Side{}, err
+	case !found:
+		// A submodule that is not checked out is unchanged (status.Missing).
+		unchanged, missingErr := status.Missing(r, e)
+		if missingErr != nil || !unchanged {
+			return Side{}, missingErr
+		}
+		return Side{Mode: e.Mode, Hash: e.Hash}, nil
 	case !e.IntentToAdd && ix.UpToDate(e, fi):
 		return Side{Mode: e.Mode, Hash: e.Hash}, nil
 	case !repo.IsFileOrLink(fi.Mode()):

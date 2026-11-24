@@ -567,7 +567,8 @@ paths (like `B` above) is shown only once. This gives the same order as
 `--oneline` shows each hash's **shortest unique prefix** of at least 7
 characters (`Store.Abbrev`): it looks at the other objects that start with
 the same two characters and makes the prefix one character longer than the
-longest shared prefix.
+longest shared prefix. (In a big repository the starting length grows past
+7: lesson 6.6.)
 
 ### 3.6 Naming commits (`rev-parse`)
 
@@ -1851,8 +1852,9 @@ index 9c7fba5..bcff1a7 100644
 
 - `diff --git a/sum.c b/sum.c` names the file on both sides.
 - `index 9c7fba5..bcff1a7 100644` gives the hashes of the blob before and
-  after, shortened to 7 characters, and the mode when it did not change. A
-  new file shows `new file mode 100644` and `0000000` before; a deleted one
+  after, shortened (to 7 characters, unless the repository is big: see
+  6.6), and the mode when it did not change. A new file shows
+  `new file mode 100644` and `0000000` before; a deleted one
   `deleted file mode`; a new mode `old mode` and `new mode`. When only the
   mode changed, the header is all there is.
 - `---` and `+++` name the two sides again, with `/dev/null` for a side that
@@ -1869,9 +1871,10 @@ index 9c7fba5..bcff1a7 100644
   the hunk that starts with a letter, `_` or `$`, which in most languages is
   the line that starts a function. Git keeps 80 bytes of it, drops the
   spaces at its end, and cuts the header at the first byte that is not valid
-  UTF-8, so a broken file cannot break your terminal. (`.gitattributes` can
-  tell Git how to find functions in each language; mgit always uses this
-  default.)
+  UTF-8, so a broken file cannot break your terminal. (A `.gitattributes`
+  file can give a file a *diff driver*, such as `diff=golang`, with its own
+  rule for function names. mgit has no drivers, so it refuses to show the
+  patch of such a file: see 6.8.)
 
 Some files get no hunks:
 
@@ -1920,8 +1923,102 @@ two of them. A few rules, all Git's:
   which is why such an index is version 3), keeps them when it writes the
   index, and follows the same rules. A first version of this step dropped
   them every time it wrote the index, which silently undid a `git add -N`.
+- **Short hashes.** The `index` line shortens a hash to the fewest
+  characters that no other object starts with, but never fewer than a
+  starting length. That length grows with the repository: Git counts its
+  *packed* objects (lesson 1: Git packs objects together, and `git gc`,
+  `clone` and `fetch` do it), takes half the number of bits of that count,
+  rounded up, and never less than 7. At 16,384 packed objects, a 15-bit
+  number, it starts at 8. (Why half? Among about 2^b random hashes, two
+  probably share their first b/2 hex characters: the birthday paradox.)
+  mgit cannot read packed objects yet, but it reads the packs' index files
+  (`.git/objects/pack/*.idx`, and the `multi-pack-index` that covers
+  several packs). Each is a sorted list of hashes, which is enough to count
+  them and to find the ones next to yours (`internal/object/pack.go`). Asked
+  for the contents of a packed object, mgit says that it is in a pack.
+- **Submodules.** A *submodule* is another repository inside this one. The
+  index and the trees record it as a commit of that repository, with the
+  mode `160000` (a *gitlink*). `git diff` compares the recorded commits,
+  and in the working tree it asks the submodule's own repository which
+  commit it is on. A submodule that is not checked out is an empty folder
+  (what `git clone` leaves without `--recurse-submodules`): Git counts it
+  as unchanged, and a missing folder as deleted. mgit does the same. It
+  refuses a folder that holds a repository of its own, a checked-out
+  submodule or a clone, since it cannot ask that repository anything yet.
+- **There is no working tree inside `.git`.** Run from inside the `.git`
+  folder, Git refuses what needs the working tree (`diff` without
+  `--cached` or two commits, `add`, `status`, `commit` and `checkout`) with
+  `this operation must be run in a work tree`, and does the rest. mgit now
+  does the same; it used to take the folder above `.git` as the working
+  tree.
 
-### 6.7 What mgit leaves out
+### 6.7 Reading the arguments the way Git does
+
+Each argument of `git diff` goes through rules that Git has gathered over
+the years, and each rule is a place where mgit can differ. The review of
+6.10 found differences in most of them.
+
+**Revision suffixes.** Besides `~n` and `^n` (lesson 3.6), Git knows these
+(`revision.c`):
+
+| Argument | Means |
+|----------|-------|
+| `^A` | leave A out: in `diff`, that marks the old side, so `diff ^A B` is `diff A B` |
+| `A^@` | the parents of A, but not A |
+| `A^!` | A, but not its parents: for a commit with one parent, `diff A^!` is `diff A^ A` |
+| `A^-`, `A^-n` | A, but not its first (or n-th) parent |
+
+`diff` then counts the commits it got. None compares the index with the
+working tree, one compares that commit with the working tree (or with the
+index, after `--cached`), and two compare them with each other. Three or
+more ask for a *combined diff*, which mgit refuses: `M^!` of a merge `M`
+gives three. The rules are exact. `HEAD~2^@`, the parents of the first
+commit, is no commit at all, so `diff HEAD~2^@` is plain `diff`. `A^-0`
+and `A^-x` are not revisions, so Git tries them as paths. A suffix Git does
+not know, as in `HEAD~x` or `HEAD^foo`, makes the whole name unknown,
+where the first version of mgit silently picked some other commit. And a
+range (`A..B`) cannot come with any other revision.
+
+**Paths inside revisions.** In `A:path` (lesson 3.6), the path starts at
+the top of the tree, wherever you are, unless it starts with `./` or
+`../`: then it starts in the folder you are in, like a path on the command
+line (`HEAD:./x`, run in `d`, is `HEAD:d/x`). Any other path must name the
+entries exactly: no `/` at the start, no empty part (`d//x`), no `.` or
+`..`, and a `/` at the end only after a folder. `A:` alone is the whole
+tree.
+
+**Paths you type.** Git cleans a path up as text before it looks at the
+disk (`normalize_path_copy`): it puts the folder you are in in front,
+follows `.` and `..`, and drops doubled slashes, so `d/../f` and `.//f`
+both mean `f`. A path that ends up above the working tree is an error, and
+so is an absolute path outside it, even one that comes back in
+(`../repo/f`). An absolute path may reach the working tree through a
+symbolic link, because Git compares the real folders
+(`abspath_part_inside_repo`). mgit follows the same steps
+(`internal/repo/prefix.go`); its first version asked the file system
+instead, and took paths that Git refuses. Then, what a path matches:
+
+- a path that ends in `/` matches a folder only: `d/` matches `d/x`, but
+  `f/` matches nothing when `f` is a file;
+- the empty path `''` is an error (`empty string is not a valid pathspec`),
+  not "everything";
+- `*`, `?`, `[` and `\` make a path a *pattern* (`'*.c'` matches
+  `src/a.c`), and a path that starts with `:` can carry *magic*
+  (`:(top)f`, `:!f`). mgit has neither yet, so it refuses such paths
+  rather than take them letter by letter.
+
+**Numbers.** Git reads `-U<n>` with C's `strtol`, which skips spaces and
+takes a sign (`"-U 2"` and `-U+2` are `-U2`), and keeps the result in an
+`int`, so only the low 32 bits of the number remain: `-U4294967299` is
+`-U3`. A number that ends up negative, such as `-U2147483648`, makes Git
+print hunk headers that no tool can read. mgit does the same arithmetic
+(`cStrtol` in `cmd/mgit/diff.go`), and refuses the numbers that would
+break the headers. The engine had its own problem with huge numbers: to
+see whether two changes share a hunk, it doubled the context, and past
+2^62 the doubling overflowed. It now first cuts the context down to the
+length of the file, which changes nothing else.
+
+### 6.8 What mgit leaves out
 
 Git's `diff` does much more. What mgit cannot show yet, it refuses, rather
 than print something different from Git:
@@ -1931,15 +2028,38 @@ than print something different from Git:
   `git diff --no-renames` prints. Its tests turn rename detection off in Git
   (`diff.renames=false`).
 - **Refused, with a message:** `A...B` (a diff from the merge base), three
-  or more commits (a combined diff), two blobs, and a file in the middle of
-  a merge conflict.
+  or more commits (a combined diff), two blobs, a file in the middle of a
+  merge conflict, patterns and magic in paths, `-U` numbers that would
+  break the hunk headers, and checked-out submodules (6.6).
+- **Attributes, refused.** `.gitattributes` files tell Git how to treat
+  each path: how to show it (`diff=golang` picks a diff driver, and `-diff`
+  or `binary` shows it as binary), and how to read it from the working tree
+  (`text`, `eol` and `crlf` turn CR LF line ends into LF, `ident` expands
+  `$Id$`, and `filter` or `working-tree-encoding` runs a conversion). mgit
+  reads every attribute file Git reads, with Git's rules for patterns and
+  macros (`internal/attr`), but applies none of them. It refuses to show
+  the patch of a file whose attributes may change how Git shows it, and,
+  when it reads the working tree, a file that Git would convert on the way
+  in (or any file, with `core.autocrlf`). `--name-only` and `--name-status`
+  do not depend on how a file is shown, so they still work. mgit's own
+  repository has such a file (`diff=golang` for its Go code): try
+  `--name-status` there.
+- **Indexes mgit cannot read, refused.** After its entries, the index can
+  hold *extensions*, each named by four letters. A name that starts with a
+  capital letter, like `TREE`, is a cache that a reader may skip, and mgit
+  skips it. Any other name means "do not read this index without me":
+  `link` (`core.splitIndex` splits the index into two files) and `sdir`
+  (`index.sparse` keeps whole folders outside a sparse checkout as single
+  entries). The first version skipped those too, and saw an empty or
+  partial index. mgit now stops, and says which Git command turns each one
+  off.
 - **Not there:** options such as `--stat`, `-R`, `-w`, `--word-diff`,
-  `--color` and `--no-index`; diff drivers in `.gitattributes`; and changes
-  inside submodules.
-- Hashes are always shortened to 7 characters. Git uses more in very large
-  repositories, where 7 characters stop being unique.
+  `--color` and `--no-index`, and the `core.abbrev` setting.
+- **Only `diff` looks at attributes.** `add`, `status` and `commit -a`,
+  from the earlier steps, do not read them yet: with `text` set on a file
+  with CR LF line ends, Git stores LF, and mgit stores the file as it is.
 
-### 6.8 How it was tested, and a bug a fuzzer found
+### 6.9 How it was tested, and a bug a fuzzer found
 
 Three kinds of tests check `diff`:
 
@@ -1953,13 +2073,21 @@ Three kinds of tests check `diff`:
    lines (the long-run shortcut), and function lines that are long or not
    valid UTF-8. To make sure the shortcuts really ran, counters added for
    one run showed the cost limit cut 127 times, and the long-run shortcut
-   95 times.
+   95 times. After the review (6.10) came four more: a long text against a
+   short one and a huge text against a smaller one (the search reaches the
+   edges of its box), a text that keeps one line in ten of another, and
+   runs of over 20 blank lines with indents past 200 columns (the limits of
+   the indent heuristic).
 2. **The command against Git, in twins** (`e2e/diff_test.go`, as in lesson
    5.7): 27 situations, each with 12 ways of calling `diff`; revisions,
    ranges and paths, and their mistakes; quoted names; function names; and
    40 rounds of random edits, deletions, new modes, symbolic links, staging
    and commits. `e2e/flags_test.go` does the same for the marks on index
-   entries, with `status`, `add` and `commit -a` too.
+   entries, with `status`, `add` and `commit -a` too, and
+   `e2e/diff_rules_test.go` takes Git's rules one at a time (6.6 and 6.7):
+   revision suffixes, paths in revisions and on the command line, `-U`
+   numbers, submodules, the `.git` folder, 16,400 packed objects, and
+   attributes. For what mgit refuses, it checks the message.
 3. **Properties, and a fuzzer** (`internal/diff/diff_test.go`). Some things
    must hold for any two texts: the changes `Lines` finds turn the old text
    into the new one, and so do the hunks `Unified` prints, applied like a
@@ -1990,6 +2118,36 @@ them. The fuzzer saved its input in `internal/diff/testdata/fuzz/FuzzDiff`,
 where every `go test` runs it again, and the comparison with Git has it too.
 The lesson: a bound is a claim about your code. It needs a reason, like the
 code it guards, and a fuzzer is good at testing such claims.
+
+### 6.10 What a review found
+
+All these tests passed, and the step looked done. Then the code went
+through a review: reviewers who had not written it read Git's source part
+by part, wrote scenarios that run the same commands in a Git copy and an
+mgit copy of a repository, and compared every byte. They found fifteen
+problems.
+
+- **In the engine, none in the output.** The reviewer compared it with
+  xdiff line by line and ran thousands more pairs of texts, and all of
+  them matched. But coverage showed four special cases of xdiff that no
+  comparison with Git ever reached, so a later change could break them
+  unnoticed (the new generators of 6.9 reach them), and a context past
+  2^62 overflowed (6.7), which only a Go program could ask for.
+- **In the command, thirteen, all of one kind.** Each was an argument or a
+  repository the tests had never tried: a submodule, a split index,
+  `HEAD^!`, `HEAD:./x`, `'*.c'`, `:!f`, `.gitattributes`, packed objects,
+  a path ending in `/`, `''`, `-U4294967299`, a path through a symbolic
+  link, and `diff` run inside `.git`. For each, mgit printed an answer,
+  and it was not Git's.
+
+Two lessons. First, your own tests share your blind spots: they try what
+you thought of, and the bugs live in what you did not. Someone who starts
+from Git's source, rule by rule, finds the rest. Second, a silent wrong
+answer is the worst kind of bug, because nobody knows to look for it.
+mgit now does nine of the thirteen as Git does, and refuses four with a
+message (patterns, magic, attributes, and indexes it cannot read), along
+with the parts of the others that it cannot do yet. A refusal is honest; a
+different answer is a bug.
 
 ### Try it
 
@@ -2036,6 +2194,12 @@ git diff --no-index --no-indent-heuristic old.c new.c
 mgit diff nothing-there              # neither: an error
 mgit branch sum.c && mgit diff sum.c # both: an error that asks for --
 mgit diff -- sum.c
+
+# Git's rules for arguments (6.7)
+mgit diff 'HEAD^!'                   # the last commit: HEAD^ against HEAD
+mgit diff HEAD ^HEAD~1 --name-only   # ^ marks the old side
+mgit diff -- ./x/../sum.c            # . and .. are followed as text
+mgit diff -- '*.c'                   # a pattern: refused, for now
 ```
 
 ### Exercises
@@ -2064,7 +2228,19 @@ mgit diff -- sum.c
 7. **Fuzz it.** Run `go test ./internal/diff -run '^$' -fuzz FuzzDiff
    -fuzztime 1m`. Then move the saved input out of `testdata`, make
    `compact` call `t.next` for every group again with one bound for all of
-   them, and see how long the fuzzer takes to find the bug of 6.8.
+   them, and see how long the fuzzer takes to find the bug of 6.9.
+8. **Patterns.** Make paths with `*`, `?` and `[...]` match as Git's
+   pathspecs do. By default, `*` matches any characters, `/` included, so
+   `'*.c'` finds `src/lib/b.c`. Write the matcher with a loop that keeps
+   one place to go back to, not with recursion (rule 1), and compare with
+   `git diff -- '*.c'`.
+9. **Binary by attribute.** Show a file whose attributes say `-diff` or
+   `binary` as `Binary files a/x and b/x differ`, as Git does, instead of
+   refusing it. Which refusals of 6.8 can you then drop?
+10. **Read a pack.** A `.pack` file holds objects compressed with zlib,
+    some of them stored as a *delta* against another object: copy these
+    bytes from it, then insert those. Use the `.idx` file to find where an
+    object starts, and read it. Check your work with `git verify-pack -v`.
 
 ---
 
@@ -2088,7 +2264,7 @@ There are three kinds of tests (`go test ./...`, or `make test`):
   in the other, and both must end up identical
   ([lesson 5.7](#57-testing-against-git-twice)). The diff engine is also
   compared with `git diff --no-index` on thousands of random pairs of texts
-  ([lesson 6.8](#68-how-it-was-tested-and-a-bug-a-fuzzer-found)).
+  ([lesson 6.9](#69-how-it-was-tested-and-a-bug-a-fuzzer-found)).
 - **Fuzz tests** check properties that hold for any input: for example,
   that the hunks of a diff, applied like a patch, turn the old text into
   the new one. `go test` runs them on the inputs saved in `testdata`, and

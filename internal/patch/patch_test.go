@@ -21,19 +21,26 @@ func TestPathspecMatches(t *testing.T) {
 	cases := []struct {
 		ps   Pathspec
 		path string
+		mode uint32
 		want bool
 	}{
-		{nil, "any/path", true},
-		{Pathspec{""}, "any/path", true},
-		{Pathspec{"d"}, "d", true},
-		{Pathspec{"d"}, "d/x", true},
-		{Pathspec{"d"}, "dx", false},
-		{Pathspec{"d/x"}, "d", false},
-		{Pathspec{"a", "d"}, "d/e/f", true},
+		{nil, "anything", index.ModeFile, true},
+		{Pathspec{""}, "any/path", index.ModeFile, true},
+		{Pathspec{"d"}, "d", index.ModeFile, true},
+		{Pathspec{"d"}, "d/x", index.ModeFile, true},
+		{Pathspec{"d"}, "dx", index.ModeFile, false},
+		{Pathspec{"d/x"}, "d", index.ModeFile, false},
+		{Pathspec{"a", "d"}, "d/e/f", index.ModeFile, true},
+		// A slash at the end means a folder: never a file or link d.
+		{Pathspec{"d/"}, "d/x", index.ModeFile, true},
+		{Pathspec{"d/"}, "d", index.ModeFile, false},
+		{Pathspec{"d/"}, "d", index.ModeSymlink, false},
+		{Pathspec{"d/"}, "d", index.ModeSubmodule, true},
+		{Pathspec{"d/"}, "dx", index.ModeFile, false},
 	}
 	for _, c := range cases {
-		if got := c.ps.Matches(c.path); got != c.want {
-			t.Errorf("%q.Matches(%q) = %v", c.ps, c.path, got)
+		if got := c.ps.Matches(c.path, c.mode); got != c.want {
+			t.Errorf("%q.Matches(%q, %o) = %v", c.ps, c.path, c.mode, got)
 		}
 	}
 }

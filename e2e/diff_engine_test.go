@@ -6,8 +6,11 @@ package e2e
 // the engine: few distinct lines (many ways to align them, so sliding
 // matters), code-like indentation and blank lines (the indent heuristic),
 // lines repeated very often (discarded before the search), long shuffled
-// texts (the shortcuts Git takes when a search grows long), missing final
-// newlines, and function lines that are long or not valid UTF-8.
+// texts (the shortcuts Git takes when a search grows long), a long text
+// against a short one (the widest searches, where those shortcuts reach
+// the edges), long runs of blank lines and very deep indents (where the
+// indent heuristic stops measuring), missing final newlines, and function
+// lines that are long or not valid UTF-8.
 
 import (
 	"bytes"
@@ -77,6 +80,10 @@ func TestDiffEngineMatchesGit(t *testing.T) {
 		{"long shuffled texts", 25, shuffledPair},
 		{"function names", 60, funcNamePair},
 		{"huge texts", 6, hugePair},
+		{"long against short", 60, longShortPair},
+		{"huge against smaller", 3, hugeShortPair},
+		{"one line in ten kept", 40, keptLinesPair},
+		{"blank lines and deep indents", 200, blankLinesPair},
 	}
 	for gi, g := range generators {
 		t.Run(g.name, func(t *testing.T) {
@@ -234,6 +241,115 @@ func hugePair(r *rand.Rand) (a, b []byte) {
 			after[i] = fmt.Sprintf("new %d", r.IntN(n))
 		}
 	}
+	return join(r, before), join(r, after)
+}
+
+// longShortPair compares a long text with a short one made of the same few
+// lines, so that the search spans a box far wider than it is tall, and the
+// shortcuts Git takes when a search grows long run into its edges.
+func longShortPair(r *rand.Rand) (a, b []byte) {
+	values := 2 + r.IntN(40)
+	pick := func() string { return "v" + strconv.Itoa(r.IntN(values)) }
+	long := make([]string, 300+r.IntN(3000))
+	for i := range long {
+		long[i] = pick()
+	}
+	short := make([]string, 1+r.IntN(80))
+	for i := range short {
+		short[i] = pick()
+	}
+	if r.IntN(2) == 0 {
+		return join(r, long), join(r, short)
+	}
+	return join(r, short), join(r, long)
+}
+
+// hugeShortPair compares a huge text with one about six times smaller,
+// which keeps some of its runs of lines: together they are long enough
+// (over 65,536 lines) for every shortcut Git takes.
+func hugeShortPair(r *rand.Rand) (a, b []byte) {
+	n := 60000 + r.IntN(20000)
+	pick := func() string { return "q" + strconv.Itoa(r.IntN(3*n)) }
+	huge := make([]string, n)
+	for i := range huge {
+		huge[i] = pick()
+	}
+	var smaller []string
+	for i := 0; i < n; {
+		end := min(i+1+r.IntN(40), n)
+		if r.IntN(6) == 0 {
+			smaller = append(smaller, huge[i:end]...)
+		}
+		if r.IntN(3) == 0 {
+			smaller = append(smaller, pick())
+		}
+		i = end
+	}
+	for len(smaller)+n < 66000 {
+		smaller = append(smaller, huge[r.IntN(n)])
+	}
+	if r.IntN(2) == 0 {
+		return join(r, huge), join(r, smaller)
+	}
+	return join(r, smaller), join(r, huge)
+}
+
+// keptLinesPair keeps about one line in ten of a long text, with a few new
+// lines among them.
+func keptLinesPair(r *rand.Rand) (a, b []byte) {
+	values := 5 + r.IntN(200)
+	pick := func() string { return "w" + strconv.Itoa(r.IntN(values)) }
+	long := make([]string, 500+r.IntN(4000))
+	var kept []string
+	for i := range long {
+		long[i] = pick()
+		if r.IntN(10) == 0 {
+			kept = append(kept, long[i])
+		}
+		if r.IntN(50) == 0 {
+			kept = append(kept, pick())
+		}
+	}
+	if r.IntN(2) == 0 {
+		return join(r, long), join(r, kept)
+	}
+	return join(r, kept), join(r, long)
+}
+
+// blankLinesPair has runs of blank lines longer than the indent heuristic
+// counts (20), lines of white space only (which it takes as blank), and
+// lines indented deeper than it measures (200 columns).
+func blankLinesPair(r *rand.Rand) (a, b []byte) {
+	spaces := []string{" ", "\t", "\r", "\v", "\f", "  ", "\t "}
+	pick := func() string {
+		switch r.IntN(10) {
+		case 0, 1, 2:
+			return ""
+		case 3: // white space only
+			var line strings.Builder
+			for range 1 + r.IntN(3) {
+				line.WriteString(spaces[r.IntN(len(spaces))])
+			}
+			return line.String()
+		case 4:
+			return strings.Repeat(" ", 190+r.IntN(30)) + "deep"
+		case 5:
+			return strings.Repeat("\t", r.IntN(30)) + "}"
+		default:
+			indent := strings.Repeat(spaces[r.IntN(2)], r.IntN(6))
+			return indent + []string{"x", "y", "{", "}", "if (a)"}[r.IntN(5)]
+		}
+	}
+	var before []string
+	for range 5 + r.IntN(20) {
+		if r.IntN(3) == 0 {
+			before = append(before, make([]string, 15+r.IntN(30))...)
+		}
+		for range 1 + r.IntN(6) {
+			before = append(before, pick())
+		}
+	}
+	after := edit(r, before, 1+r.IntN(6), pick)
 	return join(r, before), join(r, after)
 }
 

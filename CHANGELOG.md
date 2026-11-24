@@ -31,6 +31,11 @@ changes.
     `git add -N`.
   - `status`, `add` and `commit -a` handle a tracked file that was replaced by
     a folder, or a folder replaced by a file, the way git does.
+  - An index with an extension that readers must understand is refused with a
+    message, instead of being read as empty or partial: a split index
+    (`core.splitIndex`), a sparse index (`index.sparse`), or any other
+    extension whose name does not start with a capital letter. The message
+    says which git command turns it off.
   - `status` shows a file that became a symbolic link, or the other way
     round, as a type change (`T`, "typechange:"), as git does.
   - FIFOs, sockets and devices in the working tree are skipped like git
@@ -120,8 +125,36 @@ changes.
   - `-U<n>` (`--unified=<n>`), `--name-only`, `--name-status`, `--exit-code`
     and `--quiet`. Revisions and paths are told apart as git does, with its
     errors for a name that is both, or neither.
+  - Revision suffixes as in git: `A^@` (the parents of A), `A^!` (A without
+    its parents), `A^-` and `A^-<n>` (A without its first or n-th parent),
+    and `^A` to mark the old side. A suffix git does not know, as in `HEAD~x`
+    or `HEAD^foo`, is an error, as in git; mgit used to pick another commit.
+  - `A:./path` and `A:../path` start in the current folder, as in git. Other
+    paths inside a revision must name the entries exactly: no leading `/`,
+    no empty part, no `.` or `..`, and a trailing `/` only after a folder.
+  - Paths are cleaned up as text the way git does: the current folder in
+    front, `.` and `..` followed, doubled slashes dropped. Absolute paths
+    work, also through a symbolic link to the working tree, and a path that
+    leaves the working tree is an error. A path ending in `/` matches only a
+    folder, and `''` is an error, as in git.
+  - `-U` reads its number as git does (C's `strtol`, then the low 32 bits),
+    so `-U4294967299` is `-U3`. Numbers that make git print broken hunk
+    headers are refused. The engine no longer overflows with a context past
+    2^62.
+  - Submodules: one that is not checked out (an empty folder) shows nothing,
+    and one whose folder is gone shows as deleted, as in git. A folder that
+    holds a repository of its own is refused.
+  - Short hashes count packed objects, as git does: mgit reads the pack
+    indexes (`.idx` files and the multi-pack-index), so a repository with
+    16,384 packed objects or more gets 8 or more digits, in `diff`,
+    `log --oneline` and `rev-parse --short` alike, and short names also find
+    packed objects. Reading a packed object says that it is in a pack.
   - What mgit cannot show yet is refused with a message: `A...B`, three or
-    more commits, blobs, and files in the middle of a merge conflict.
+    more commits, blobs, files in the middle of a merge conflict, wildcards
+    and pathspec magic in paths, and files whose `.gitattributes` (or
+    `core.autocrlf`) may change how git shows them or reads them from the
+    working tree. `--name-only` and `--name-status` still work with diff
+    drivers.
   - A wrong option of `diff` prints the usage and exits with status 129, as
     in git.
 - **Robustness**
@@ -138,6 +171,9 @@ changes.
     crash.
   - Usage errors exit with status 129, as in git, and an error while printing
     the output (such as a full disk) is reported, with exit status 1.
+  - `add`, `status`, `commit`, `checkout` and a `diff` of the working tree
+    refuse to run inside the `.git` folder, where there is no working tree,
+    as git does.
 - **Engineering**
   - Continuous integration with GitHub Actions: tests on Linux and macOS with
     Go 1.26 and 1.27, a Windows cross-compile, and a `go mod tidy` check.
@@ -164,6 +200,9 @@ changes.
     policy and a code of conduct.
   - A fuzz test for the diff engine. It found a wrong loop bound in the
     sliding of changes before the code was released.
+  - End-to-end tests for each of git's rules for `diff` arguments and
+    repositories, and four more kinds of random texts for the diff engine,
+    added after a review found fifteen differences from git.
 - **Learning**
   - `LEARNING.md` with lessons 0 to 6: one lesson per build step, explaining
     how and why each part was built.

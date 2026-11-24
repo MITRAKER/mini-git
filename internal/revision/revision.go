@@ -14,6 +14,9 @@
 //	<rev>^{}         follow annotated tags until something that is not a tag
 //	<rev>:<path>     the file or folder at path in that commit
 //	:<path>          the file at path in the index (the staging area)
+//
+// A <path> is from the top of the working tree, unless it starts with "./"
+// or "../": then it is from the folder the command runs in.
 package revision
 
 import (
@@ -238,9 +241,15 @@ func applySuffix(r *repo.Repo, h object.Hash, suffix, rev string) (object.Hash, 
 	return h, nil
 }
 
-// applyStep applies the first step of suffix and returns the rest.
+// applyStep applies the first step of suffix and returns the rest. A step
+// starts with "~" or "^": anything else, as in "HEAD~x" or "HEAD^-1", is
+// not a revision (Git reads "X^-1" and "X^!" only as whole arguments; see
+// cmd/mgit/diff.go).
 func applyStep(r *repo.Repo, h object.Hash, suffix string) (object.Hash, string, error) {
 	op, rest := suffix[0], suffix[1:]
+	if op != '~' && op != '^' {
+		return h, "", fmt.Errorf("unexpected %q", suffix)
+	}
 	if op == '^' && strings.HasPrefix(rest, "{") {
 		end := strings.IndexByte(rest, '}')
 		if end < 0 {
@@ -383,59 +392,93 @@ func commitTree(data []byte) (object.Hash, error) {
 }
 
 // lookupPath finds p inside the tree of the commit (or tree) h, which rev
-// named, by reading one tree per folder name.
+// named, by reading one tree per folder name. Like Git (get_tree_entry),
+// it takes the names as they are: "" is the tree itself, a "/" may end the
+// path after a folder, and an empty name, "." or ".." matches nothing. A
+// path that starts with "./" or "../" is from the current folder.
 func lookupPath(r *repo.Repo, h object.Hash, rev, p string) (object.Hash, error) {
 	h, err := Peel(r, h, object.Tree)
 	if err != nil {
 		return h, fmt.Errorf("%q: %w", rev, err)
 	}
-	dir := "" // the folder searched so far, for error messages
-	for _, part := range strings.Split(p, "/") {
-		if part == "" || part == "." {
-			continue
-		}
-		next, found, err := lookupName(r, h, dir, part)
-		if err != nil {
-			return h, fmt.Errorf("%q: %w", rev+":"+p, err)
-		}
-		if !found {
-			return h, fmt.Errorf("path '%s' does not exist in '%s'", p, rev)
-		}
-		h, dir = next, path.Join(dir, part)
+	rel, err := fromTop(r, p)
+	if err != nil {
+		return h, err
 	}
-	return h, nil
+	dir, rest := "", rel // dir is the folder searched so far, for error messages
+	for range len(rel) + 1 {
+		if rest == "" {
+			return h, nil
+		}
+		name, after, more := strings.Cut(rest, "/")
+		e, found, err := lookupName(r, h, dir, name)
+		switch {
+		case err != nil:
+			return h, fmt.Errorf("%q: %w", rev+":"+p, err)
+		case !found || (more && e.Mode != object.ModeDir):
+			return h, fmt.Errorf("path '%s' does not exist in '%s'", rel, rev)
+		}
+		h, dir, rest = e.Hash, path.Join(dir, name), after
+	}
+	return h, fmt.Errorf("path '%s' is too long", rel) // cannot happen: each round reads a name
 }
 
 // lookupName finds name in the tree h, the folder dir.
-func lookupName(r *repo.Repo, h object.Hash, dir, name string) (object.Hash, bool, error) {
+func lookupName(r *repo.Repo, h object.Hash, dir, name string) (object.TreeEntry, bool, error) {
 	t, data, err := r.Objects.Read(h)
 	if err != nil {
-		return h, false, err
+		return object.TreeEntry{}, false, err
 	}
 	if t != object.Tree {
-		return h, false, fmt.Errorf("'%s' is not a folder", dir)
+		return object.TreeEntry{}, false, fmt.Errorf("'%s' is not a folder", dir)
 	}
 	entries, err := object.ParseTree(data)
 	if err != nil {
-		return h, false, err
+		return object.TreeEntry{}, false, err
 	}
 	for _, e := range entries {
 		if e.Name == name {
-			return e.Hash, true, nil
+			return e, true, nil
 		}
 	}
-	return h, false, nil
+	return object.TreeEntry{}, false, nil
 }
 
-// fromIndex returns the blob staged at path p.
+// fromIndex returns the blob staged at path p. Like Git, it takes p as it
+// is, unless it starts with "./" or "../".
 func fromIndex(r *repo.Repo, p string) (object.Hash, error) {
+	rel, err := fromTop(r, p)
+	if err != nil {
+		return object.Hash{}, err
+	}
 	ix, err := index.Read(r.IndexPath())
 	if err != nil {
 		return object.Hash{}, err
 	}
-	e := ix.Get(strings.TrimPrefix(p, "./"))
-	if e == nil {
-		return object.Hash{}, fmt.Errorf("path '%s' is not in the index", p)
+	e := ix.Get(rel)
+	switch {
+	case e == nil:
+		return object.Hash{}, fmt.Errorf("path '%s' is not in the index", rel)
+	case e.Stage != 0:
+		return object.Hash{}, fmt.Errorf("path '%s' is in the index, but not at stage 0", rel)
 	}
 	return e.Hash, nil
+}
+
+// fromTop turns a path that starts with "./" or "../", which is from the
+// folder the command runs in, into a path from the top of the working
+// tree, as Git does (resolve_relative_path). It leaves other paths alone:
+// they are from the top already.
+func fromTop(r *repo.Repo, p string) (string, error) {
+	if !strings.HasPrefix(p, "./") && !strings.HasPrefix(p, "../") {
+		return p, nil
+	}
+	prefix, inWorkTree, err := r.Prefix()
+	switch {
+	case err != nil:
+		return "", err
+	case !inWorkTree:
+		return "", errors.New("relative path syntax can't be used outside working tree")
+	}
+	return r.PrefixPath(prefix, p)
 }

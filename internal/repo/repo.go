@@ -157,6 +157,46 @@ func (r *Repo) StatTracked(rel string) (os.FileInfo, bool, error) {
 	return fi, true, nil
 }
 
+// ErrNestedRepo is the error for a repository inside the working tree: a
+// checked-out submodule, or a repository someone put there. Git looks at
+// its HEAD and its changes, or adds it as a submodule; mgit cannot look
+// inside other repositories yet.
+var ErrNestedRepo = errors.New("holds a repository of its own (a checked-out submodule?), which mgit cannot look inside yet")
+
+// Folder is what stands at a tracked path where StatTracked finds no file.
+type Folder uint8
+
+// The answers of FolderAt.
+const (
+	NoFolder    Folder = iota // nothing: the file was deleted
+	PlainFolder               // a folder
+	RepoFolder                // a folder with a repository of its own: a ".git" in it
+)
+
+// FolderAt looks at the tracked path rel when StatTracked found no file
+// there. A submodule that is not checked out, as `git clone` leaves it, is
+// an empty folder; a checked-out one, or any repository put there, has a
+// ".git" folder or file in it.
+func (r *Repo) FolderAt(rel string) (Folder, error) {
+	fi, err := r.Lstat(rel)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return NoFolder, nil
+	case err != nil:
+		return NoFolder, err
+	case !fi.IsDir():
+		return NoFolder, nil
+	}
+	_, err = os.Lstat(filepath.Join(r.AbsPath(rel), ".git"))
+	switch {
+	case err == nil:
+		return RepoFolder, nil
+	case errors.Is(err, os.ErrNotExist):
+		return PlainFolder, nil
+	}
+	return NoFolder, err
+}
+
 // Lstat describes the repository path rel in the working tree without
 // following any symbolic link: not at rel itself, and not in the folders
 // above it. A path behind a link ("a/b" where "a" is a link) is reported as
@@ -211,7 +251,10 @@ func IsGitDirName(name string) bool { return strings.EqualFold(name, ".git") }
 // ListFiles returns every file and symbolic link under the repository folder
 // rel ("" for the whole working tree), as sorted repository paths. It skips
 // .git folders and special files (see IsFileOrLink). Symbolic links to
-// folders are listed, not followed, which is what Git does too.
+// folders are listed, not followed, which is what Git does too. A folder
+// below the top with a ".git" in it is another repository, which Git would
+// add as a submodule: ListFiles refuses it (ErrNestedRepo) rather than list
+// that repository's files as if they were this one's.
 //
 // It walks the folders with an explicit stack instead of a recursive
 // function (coding standard, rule 1), and visits at most maxWalkDirs folders.
@@ -231,6 +274,8 @@ func (r *Repo) ListFiles(rel string) ([]string, error) {
 		for _, de := range entries {
 			child := JoinPath(dir, de.Name())
 			switch {
+			case de.Name() == ".git" && dir != "":
+				return nil, fmt.Errorf("%s %w", dir, ErrNestedRepo)
 			case IsGitDirName(de.Name()):
 				continue
 			case de.IsDir():

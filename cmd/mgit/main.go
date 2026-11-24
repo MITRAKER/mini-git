@@ -158,6 +158,24 @@ func newFlagSet(name string) *flag.FlagSet {
 // findRepo finds the repository the current folder belongs to.
 func findRepo() (*repo.Repo, error) { return repo.Find(".") }
 
+// findWorkTree finds the repository for a command that works on the files
+// of the working tree. Like Git (NEED_WORK_TREE), it refuses to run inside
+// the .git folder, which is not part of the working tree.
+func findWorkTree() (*repo.Repo, error) {
+	r, err := findRepo()
+	if err != nil {
+		return nil, err
+	}
+	_, inWorkTree, err := r.Prefix()
+	switch {
+	case err != nil:
+		return nil, err
+	case !inWorkTree:
+		return nil, repo.ErrNotInWorkTree
+	}
+	return r, nil
+}
+
 // mgit version
 func runVersion(args []string, out *output) error {
 	if len(args) > 0 {

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -77,6 +78,10 @@ func TestUnified(t *testing.T) {
 		// line that starts with a letter).
 		{"a deletion without context", "a\nb\nc\n", "a\nc\n", 0, "@@ -2 +1,0 @@ a\n-b\n"},
 		{"an insertion at the start", "b\n", "a\nb\n", 0, "@@ -0,0 +1 @@\n+a\n"},
+		// A huge context shows the whole text, in one hunk: 2*context
+		// must not overflow (found by the review).
+		{"the largest context", "X\n2\nY\n", "x\n2\ny\n", math.MaxInt, "@@ -1,3 +1,3 @@\n-X\n+x\n 2\n-Y\n+y\n"},
+		{"a context of 2^62", "X\n2\nY\n", "x\n2\ny\n", 1 << 62, "@@ -1,3 +1,3 @@\n-X\n+x\n 2\n-Y\n+y\n"},
 	}
 	for _, c := range cases {
 		got, err := Unified([]byte(c.a), []byte(c.b), c.context)

@@ -13,7 +13,7 @@
 //
 //	header:  "DIRC" | version (4 bytes) | entry count (4 bytes)
 //	entries: see Entry, each padded with NULs to a multiple of 8 bytes
-//	(extensions, which mgit skips)
+//	extensions: name (4 bytes) | size (4 bytes) | data (see checkExtensions)
 //	footer:  SHA-1 of everything above
 package index
 
@@ -267,6 +267,13 @@ func Parse(data []byte) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The extensions come after the entries, but one of them can change how
+	// the entries must be read: look at them first.
+	if end, ok := entriesEnd(body, count); ok {
+		if err := checkExtensions(body[end:]); err != nil {
+			return nil, err
+		}
+	}
 
 	ix := &Index{Entries: make([]*Entry, 0, count)}
 	pos := headerSize
@@ -281,9 +288,53 @@ func Parse(data []byte) (*Index, error) {
 		ix.Entries = append(ix.Entries, e)
 		pos += size
 	}
-	// Anything between pos and the checksum is an extension (a cache Git
-	// can rebuild). mgit ignores extensions and does not write them.
 	return ix, nil
+}
+
+// entriesEnd returns where the count entries that follow the header end,
+// reading only their sizes (see entryLayout). ok is false when they do not
+// fit: Parse then reports what is wrong with them.
+func entriesEnd(body []byte, count int) (end int, ok bool) {
+	pos := headerSize
+	for range count {
+		_, _, size, err := entryLayout(body[pos:])
+		if err != nil {
+			return 0, false
+		}
+		pos += size
+	}
+	return pos, true
+}
+
+// checkExtensions reads the extensions after the entries: each one is a
+// 4-byte name, a 4-byte size, then its data. An extension whose name
+// starts with a capital letter, such as "TREE", is a cache that Git can
+// rebuild: mgit skips it, and does not write it back. Git cannot read the
+// index without any other one, and neither can mgit (read_index_extension).
+// Like Git, it stops when fewer than 8 bytes are left.
+func checkExtensions(ext []byte) error {
+	for range len(ext)/8 + 1 {
+		if len(ext) < 8 {
+			return nil
+		}
+		name := string(ext[:4])
+		switch {
+		case name == "link":
+			return errors.New("the index is split in two files (core.splitIndex), which mgit cannot read yet; " +
+				"'git update-index --no-split-index' joins them")
+		case name == "sdir":
+			return errors.New("the index is a sparse index (index.sparse), which mgit cannot read yet; " +
+				"'git sparse-checkout set --no-sparse-index' turns it off")
+		case name[0] < 'A' || name[0] > 'Z':
+			return fmt.Errorf("index uses %.4s extension, which mgit does not understand", name)
+		}
+		size := int64(binary.BigEndian.Uint32(ext[4:8]))
+		if size > int64(len(ext)-8) {
+			return nil // past the end: Git stops too
+		}
+		ext = ext[8+size:]
+	}
+	return nil
 }
 
 // parseHeader checks the signature and version and returns the entry count.
@@ -304,10 +355,35 @@ func parseHeader(body []byte) (int, error) {
 	return int(count), nil
 }
 
+// entryLayout returns where the path of the entry at the start of b
+// begins, its length and the size of the whole entry on disk.
+func entryLayout(b []byte) (nameStart, nameLen, size int, err error) {
+	if len(b) < entryFixedSize {
+		return 0, 0, 0, errors.New("truncated")
+	}
+	nameStart = entryFixedSize
+	if binary.BigEndian.Uint16(b[60:62])&flagExtended != 0 { // version 3 adds 2 more flag bytes
+		nameStart += 2
+	}
+	if len(b) < nameStart {
+		return 0, 0, 0, errors.New("truncated")
+	}
+	nameLen = bytes.IndexByte(b[nameStart:], 0)
+	if nameLen < 0 {
+		return 0, 0, 0, errors.New("path has no terminator")
+	}
+	size = paddedLen(nameStart + nameLen)
+	if size > len(b) {
+		return 0, 0, 0, errors.New("truncated padding")
+	}
+	return nameStart, nameLen, size, nil
+}
+
 // parseEntry decodes one entry and returns its size on disk.
 func parseEntry(b []byte) (*Entry, int, error) {
-	if len(b) < entryFixedSize {
-		return nil, 0, errors.New("truncated")
+	nameStart, nameLen, size, err := entryLayout(b)
+	if err != nil {
+		return nil, 0, err
 	}
 	u32 := make([]uint32, 10)
 	for i := range u32 {
@@ -321,13 +397,7 @@ func parseEntry(b []byte) (*Entry, int, error) {
 	flags := binary.BigEndian.Uint16(b[60:62])
 	e.Stage = (flags >> flagStageShift) & maxStage
 	e.AssumeUnchanged = flags&flagValid != 0
-
-	nameStart := entryFixedSize
-	if flags&flagExtended != 0 { // version 3 adds 2 more flag bytes
-		nameStart += 2
-		if len(b) < nameStart {
-			return nil, 0, errors.New("truncated")
-		}
+	if flags&flagExtended != 0 {
 		flags2 := binary.BigEndian.Uint16(b[entryFixedSize:nameStart])
 		if flags2&^flag2Known != 0 {
 			return nil, 0, fmt.Errorf("unknown flags %#04x", flags2)
@@ -335,17 +405,9 @@ func parseEntry(b []byte) (*Entry, int, error) {
 		e.IntentToAdd = flags2&flag2IntentToAdd != 0
 		e.SkipWorktree = flags2&flag2SkipWorktree != 0
 	}
-	nul := bytes.IndexByte(b[nameStart:], 0)
-	if nul < 0 {
-		return nil, 0, errors.New("path has no terminator")
-	}
-	e.Path = string(b[nameStart : nameStart+nul])
+	e.Path = string(b[nameStart : nameStart+nameLen])
 	if err := CheckPath(e.Path, e.Mode); err != nil {
 		return nil, 0, err
-	}
-	size := paddedLen(nameStart + len(e.Path))
-	if size > len(b) {
-		return nil, 0, errors.New("truncated padding")
 	}
 	return e, size, nil
 }

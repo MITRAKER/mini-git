@@ -22,8 +22,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/MITRAKER/mini-git/internal/bounded"
 )
@@ -49,9 +51,9 @@ const (
 	// MinAbbrev is the shortest hash prefix mgit accepts or prints.
 	MinAbbrev = 4
 	// DefaultAbbrev is how many characters of a hash Git prints by
-	// default, before it adds more to keep the prefix unique. (Git uses
-	// more in repositories with tens of thousands of packed objects;
-	// mgit does not read packs.)
+	// default, before it adds more to keep the prefix unique. Git starts
+	// with more in a repository with 16,384 packed objects or more (see
+	// autoAbbrev).
 	DefaultAbbrev = 7
 	// maxDeflateRatio is the most zlib can compress data: about 1032 to 1.
 	// A header that claims more content than that is corrupt; checking it
@@ -116,6 +118,10 @@ var ErrNotFound = errors.New("object not found")
 // Store reads and writes objects in a .git/objects directory.
 type Store struct {
 	dir string
+	// packList are the lists of packed objects (see pack.go), opened the
+	// first time Abbrev needs them and kept open after that.
+	packsOnce sync.Once
+	packList  []*sortedHashes
 }
 
 // NewStore returns a store rooted at dir (usually ".git/objects").
@@ -193,6 +199,9 @@ func writeAtomically(dest string, data []byte) error {
 func (s *Store) Read(h Hash) (Type, []byte, error) {
 	compressed, err := bounded.ReadFile(s.path(h), maxCompressedSize)
 	if errors.Is(err, os.ErrNotExist) {
+		if s.isPacked(h) {
+			return "", nil, fmt.Errorf("%s is in a pack file, which mgit cannot read yet: %w", h, ErrNotFound)
+		}
 		return "", nil, fmt.Errorf("%s: %w", h, ErrNotFound)
 	}
 	if err != nil {
@@ -300,6 +309,9 @@ func (s *Store) Resolve(name string) (Hash, error) {
 	if err != nil {
 		return Hash{}, err
 	}
+	matches = append(matches, s.packedWithPrefix(name)...)
+	slices.Sort(matches)
+	matches = slices.Compact(matches) // an object can be both loose and packed
 	switch len(matches) {
 	case 0:
 		return Hash{}, fmt.Errorf("%s: %w", name, ErrNotFound)
@@ -340,24 +352,36 @@ func isHex(s string) bool {
 }
 
 // Abbrev returns the shortest prefix of h, at least minLen characters long,
-// that no other object in the store shares. This is how `git log --oneline`
-// picks how many characters of each hash to show.
+// that no other object in the store shares, the way Git shortens hashes by
+// default (core.abbrev=auto, repo_find_unique_abbrev_r). Git starts from
+// a length that grows with the number of packed objects (see autoAbbrev),
+// then looks at the packed objects whose hashes are next to h's in each
+// pack index, and at the loose objects whose hashes start the same.
 func (s *Store) Abbrev(h Hash, minLen int) string {
 	hx := h.String()
-	n := max(minLen, MinAbbrev)
+	s.packsOnce.Do(func() { s.packList = s.packs() })
+	var count uint64
+	for _, p := range s.packList {
+		count += uint64(p.count)
+	}
+	n := max(minLen, MinAbbrev, autoAbbrev(count))
+	for _, p := range s.packList {
+		near, err := p.neighbors(h)
+		if err != nil {
+			continue // as Git does with a pack index it cannot read
+		}
+		for _, other := range near {
+			n = max(n, commonHexLen(hx, other.String())+1)
+		}
+	}
 	others, err := s.withPrefix(hx[:2])
 	if err != nil {
 		return hx // cannot list the folder: the full hash is always unique
 	}
 	for _, other := range others {
-		if other == hx {
-			continue
+		if other != hx {
+			n = max(n, commonHexLen(hx, other)+1)
 		}
-		common := 0
-		for common < len(hx) && other[common] == hx[common] {
-			common++
-		}
-		n = max(n, common+1)
 	}
 	return hx[:min(n, len(hx))]
 }

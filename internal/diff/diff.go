@@ -49,6 +49,11 @@ func Unified(a, b []byte, context int) ([]byte, error) {
 	if context < 0 {
 		return nil, errors.New("diff: negative context")
 	}
+	// More context than either text has lines shows the same: all of it.
+	// Cutting it down keeps 2*context (see hunkEnd) from overflowing. Every
+	// line has at least one byte, so a text has at most len(text) lines;
+	// the +1 keeps a context of 1 or more from becoming 0.
+	context = min(context, max(len(a), len(b))+1)
 	if context == 0 {
 		// Git does this only without context, where it cannot show.
 		a, b = trimCommonTail(a, b)

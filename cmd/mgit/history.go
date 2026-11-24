@@ -41,7 +41,7 @@ func runCommit(args []string, out *output) error {
 	if err != nil {
 		return err
 	}
-	r, err := findRepo()
+	r, err := findWorkTree()
 	if err != nil {
 		return err
 	}
@@ -110,31 +110,43 @@ func commitIndex(r *repo.Repo, all bool) (*index.Index, error) {
 // stageTrackedChanges is `commit -a`: re-add every tracked file that changed
 // and drop every tracked file that was deleted. New files are not added, but
 // a file added with `git add -N` is. Entries marked assume-unchanged or
-// skip-worktree are left alone (see leftAlone).
+// skip-worktree are left alone (see leftAlone), and so is a submodule that
+// is not checked out (see deleted).
 // A racily clean file is re-added too, which compares its contents: after
 // that, no entry is racily clean (see index.Index.Racy).
 func stageTrackedChanges(r *repo.Repo, ix *index.Index) error {
 	var gone []string
 	for _, e := range ix.Entries {
-		if leftAlone(e) {
-			continue
-		}
-		fi, found, err := r.StatTracked(e.Path)
-		switch {
-		case err != nil:
+		isGone, err := restage(r, ix, e)
+		if err != nil {
 			return err
-		case !found:
+		}
+		if isGone {
 			gone = append(gone, e.Path)
-		case e.IntentToAdd || !ix.UpToDate(e, fi):
-			if err := addFile(r, ix, e.Path, fi); err != nil {
-				return err
-			}
 		}
 	}
 	for _, p := range gone {
 		ix.Remove(p)
 	}
 	return nil
+}
+
+// restage stages the tracked file of e again when it changed, and reports
+// whether it was deleted, for stageTrackedChanges.
+func restage(r *repo.Repo, ix *index.Index, e *index.Entry) (gone bool, err error) {
+	if leftAlone(e) {
+		return false, nil
+	}
+	fi, found, err := r.StatTracked(e.Path)
+	switch {
+	case err != nil:
+		return false, err
+	case !found:
+		return deleted(r, e)
+	case e.IntentToAdd || !ix.UpToDate(e, fi):
+		return false, addFile(r, ix, e.Path, fi)
+	}
+	return false, nil
 }
 
 // logOptions are the arguments `mgit log` understands.

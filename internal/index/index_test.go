@@ -201,6 +201,50 @@ func TestParseRejectsUnknownFlags(t *testing.T) {
 	}
 }
 
+// withExtensions builds an index with one entry, then the extensions given
+// as name and data, then extra bytes, and its checksum.
+func withExtensions(entryPath string, extra []byte, ext ...string) []byte {
+	b := append([]byte(signature), 0, 0, 0, 2, 0, 0, 0, 1)
+	b = appendEntry(b, &Entry{Path: entryPath, Mode: ModeFile})
+	for i := 0; i+1 < len(ext); i += 2 {
+		b = append(b, ext[i]...)
+		b = binary.BigEndian.AppendUint32(b, uint32(len(ext[i+1])))
+		b = append(b, ext[i+1]...)
+	}
+	b = append(b, extra...)
+	sum := sha1.Sum(b)
+	return append(b, sum[:]...)
+}
+
+// Like Git, Parse skips the extensions it may drop (a capital first
+// letter) and refuses the ones the entries cannot be read without, even
+// when an entry looks corrupt without them: with a split index, an entry
+// can have an empty path (it keeps the one in the shared index).
+func TestParseExtensions(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+		want string // "" for no error
+	}{
+		{"cache tree", withExtensions("a", nil, "TREE", "anything", "UNTR", ""), ""},
+		{"fewer than 8 bytes left", withExtensions("a", []byte("link"), "TREE", "x"), ""},
+		{"size past the end", withExtensions("a", []byte{'Z', 'Z', 'Z', 'Z', 0, 0, 1, 0}), ""},
+		{"split index", withExtensions("a", nil, "TREE", "", "link", "shared"), "split"},
+		{"split index, empty path", withExtensions("", nil, "link", "shared"), "split"},
+		{"sparse index", withExtensions("a", nil, "sdir", ""), "sparse index"},
+		{"unknown required", withExtensions("a", nil, "abcd", ""), "abcd extension"},
+	}
+	for _, c := range cases {
+		_, err := Parse(c.data)
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: Parse = %v", c.name, err)
+		case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+			t.Errorf("%s: Parse = %v, want an error about %q", c.name, err, c.want)
+		}
+	}
+}
+
 func TestEncodeRejectsBadEntries(t *testing.T) {
 	ix := &Index{Entries: []*Entry{{Path: "a"}, {Path: "a"}}}
 	if _, err := ix.Encode(); err == nil {

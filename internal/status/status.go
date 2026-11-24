@@ -171,6 +171,23 @@ type Worktree struct {
 	Hash   object.Hash // the blob hash of its contents; zero for a special file
 }
 
+// Missing tells what it means when the tracked path of the entry e has no
+// file on disk (repo.Repo.StatTracked): unchanged is true for a submodule
+// that is not checked out, an empty folder at the path of a submodule
+// entry, which Git does not count as deleted. Otherwise the file was
+// deleted, or a folder took its place. A folder that holds a repository is
+// an error that wraps repo.ErrNestedRepo.
+func Missing(r *repo.Repo, e *index.Entry) (unchanged bool, err error) {
+	f, err := r.FolderAt(e.Path)
+	switch {
+	case err != nil:
+		return false, err
+	case f == repo.RepoFolder:
+		return false, fmt.Errorf("%s %w", e.Path, repo.ErrNestedRepo)
+	}
+	return f == repo.PlainFolder && e.Mode == index.ModeSubmodule, nil
+}
+
 // ReadWorktree looks at the file on disk for the entry e of the index ix.
 // When the file's stat information shows that it is unchanged
 // (ix.UpToDate), it is not read: that is the fast path that makes status
@@ -180,8 +197,14 @@ type Worktree struct {
 func ReadWorktree(r *repo.Repo, ix *index.Index, e *index.Entry) (Worktree, error) {
 	fi, found, err := r.StatTracked(e.Path)
 	switch {
-	case err != nil || !found:
+	case err != nil:
 		return Worktree{}, err
+	case !found:
+		unchanged, err := Missing(r, e)
+		if err != nil || !unchanged {
+			return Worktree{}, err
+		}
+		return Worktree{Exists: true, Mode: e.Mode, Hash: e.Hash}, nil
 	case !e.IntentToAdd && ix.UpToDate(e, fi):
 		return Worktree{Exists: true, Mode: e.Mode, Hash: e.Hash}, nil
 	}
