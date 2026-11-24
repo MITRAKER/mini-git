@@ -53,6 +53,13 @@ func runCommit(args []string, out *output) error {
 	if err != nil {
 		return err
 	}
+	if *all {
+		// Saved only now, so that a commit that fails ("nothing to
+		// commit") leaves the index as it was, as in Git.
+		if err := ix.Write(r.IndexPath()); err != nil {
+			return err
+		}
+	}
 	out.printf("[%s %s] %s\n", commitWhere(res), r.Objects.Abbrev(res.Hash, 7), res.Commit.Subject())
 	return nil
 }
@@ -88,7 +95,7 @@ func commitWhere(res *history.Result) string {
 }
 
 // commitIndex reads the index; with -a it first stages every tracked file
-// that changed.
+// that changed, in memory only (runCommit saves it).
 func commitIndex(r *repo.Repo, all bool) (*index.Index, error) {
 	ix, err := index.Read(r.IndexPath())
 	if err != nil || !all {
@@ -101,19 +108,24 @@ func commitIndex(r *repo.Repo, all bool) (*index.Index, error) {
 }
 
 // stageTrackedChanges is `commit -a`: re-add every tracked file that changed
-// and drop every tracked file that was deleted. New files are not added.
+// and drop every tracked file that was deleted. New files are not added, but
+// a file added with `git add -N` is. Entries marked assume-unchanged or
+// skip-worktree are left alone (see leftAlone).
 // A racily clean file is re-added too, which compares its contents: after
 // that, no entry is racily clean (see index.Index.Racy).
 func stageTrackedChanges(r *repo.Repo, ix *index.Index) error {
 	var gone []string
 	for _, e := range ix.Entries {
+		if leftAlone(e) {
+			continue
+		}
 		fi, found, err := r.StatTracked(e.Path)
 		switch {
 		case err != nil:
 			return err
 		case !found:
 			gone = append(gone, e.Path)
-		case !ix.UpToDate(e, fi):
+		case e.IntentToAdd || !ix.UpToDate(e, fi):
 			if err := addFile(r, ix, e.Path, fi); err != nil {
 				return err
 			}
@@ -122,7 +134,7 @@ func stageTrackedChanges(r *repo.Repo, ix *index.Index) error {
 	for _, p := range gone {
 		ix.Remove(p)
 	}
-	return ix.Write(r.IndexPath())
+	return nil
 }
 
 // logOptions are the arguments `mgit log` understands.

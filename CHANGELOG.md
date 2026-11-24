@@ -22,8 +22,13 @@ changes.
   - `status` in the long format and with `--short`, whose output is the same
     as `git status --porcelain`.
   - `ls-files`, with `-s` for the mode, hash and stage of each entry.
-  - The index uses Git's binary format, version 2, with its checksum, and is
-    updated safely through a lock file (`.git/index.lock`).
+  - The index uses Git's binary format, versions 2 and 3, with its checksum,
+    and is updated safely through a lock file (`.git/index.lock`).
+  - The marks git puts on index entries are kept when mgit writes the index:
+    intent to add (`git add -N`), assume-unchanged and skip-worktree.
+    `status`, `diff`, `write-tree`, `add` and `commit -a` treat the marked
+    files as git does. mgit used to drop the marks, which silently undid a
+    `git add -N`.
   - `status`, `add` and `commit -a` handle a tracked file that was replaced by
     a folder, or a folder replaced by a file, the way git does.
   - `status` shows a file that became a symbolic link, or the other way
@@ -50,6 +55,9 @@ changes.
     `user.email` in git config.
   - Commits are byte-for-byte identical to git's: the same files, identity,
     date and message give the same commit hash.
+  - `commit -a` writes the index only once the commit is made, so a commit
+    that fails (such as "nothing to commit") leaves the index as it was, as
+    in git.
 - **Branches**
   - `branch`: list the branches (`*` marks the current one, `+` one
     checked out in another worktree, and a detached HEAD is shown as
@@ -98,6 +106,24 @@ changes.
   - If a file cannot be written half-way through a switch (a full disk, for
     example), checkout finishes the rest as git does, names the file, and
     exits with status 1; `status` then shows that file as modified.
+- **Diff**
+  - `diff` shows the changes not staged yet, the staged ones (`--cached` or
+    `--staged`, against HEAD or any commit), the changes since a commit, and
+    the changes between two commits (`A B` or `A..B`), limited to the paths
+    after `--`. The output is byte for byte what `git diff` prints with
+    rename detection off.
+  - A line diff engine that follows Git's xdiff: Myers' algorithm with Git's
+    preparation and shortcuts, the indent heuristic that slides changes to
+    where a person would put them, hunk headers with function names,
+    `\ No newline at end of file`, and binary files. It matches
+    `git diff --no-index` on thousands of random pairs of texts.
+  - `-U<n>` (`--unified=<n>`), `--name-only`, `--name-status`, `--exit-code`
+    and `--quiet`. Revisions and paths are told apart as git does, with its
+    errors for a name that is both, or neither.
+  - What mgit cannot show yet is refused with a message: `A...B`, three or
+    more commits, blobs, and files in the middle of a merge conflict.
+  - A wrong option of `diff` prints the usage and exits with status 129, as
+    in git.
 - **Robustness**
   - Every file mgit reads, and standard input, has a size limit, and an
     object's header is checked before memory is allocated for it. A corrupt
@@ -136,8 +162,10 @@ changes.
     (`docs/CODING_STANDARD.md`).
   - Issue forms, a pull request template, a contributing guide, a security
     policy and a code of conduct.
+  - A fuzz test for the diff engine. It found a wrong loop bound in the
+    sliding of changes before the code was released.
 - **Learning**
-  - `LEARNING.md` with lessons 0 to 5: one lesson per build step, explaining
+  - `LEARNING.md` with lessons 0 to 6: one lesson per build step, explaining
     how and why each part was built.
 
 [Unreleased]: https://github.com/MITRAKER/mini-git/commits/main

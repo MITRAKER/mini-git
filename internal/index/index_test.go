@@ -157,6 +157,50 @@ func TestParseRejectsCorruptIndexes(t *testing.T) {
 	}
 }
 
+// Git's marks survive a round trip, and the index is version 3 only when an
+// entry needs the second word of flags, which is what Git writes too.
+func TestFlagsRoundTrip(t *testing.T) {
+	cases := []struct {
+		e       Entry
+		version uint32
+	}{
+		{Entry{Path: "plain"}, 2},
+		{Entry{Path: "assumed", AssumeUnchanged: true}, 2},
+		{Entry{Path: "sparse", SkipWorktree: true}, 3},
+		{Entry{Path: "intent", IntentToAdd: true}, 3},
+		{Entry{Path: "all", AssumeUnchanged: true, SkipWorktree: true, IntentToAdd: true}, 3},
+	}
+	for i := range cases {
+		want := cases[i].e
+		ix := &Index{}
+		mustSet(t, ix, &want)
+		data := mustEncode(t, ix)
+		if v := binary.BigEndian.Uint32(data[4:8]); v != cases[i].version {
+			t.Errorf("%s: version %d, want %d", want.Path, v, cases[i].version)
+		}
+		got, err := Parse(data)
+		if err != nil {
+			t.Fatalf("%s: %v", want.Path, err)
+		}
+		if *got.Entries[0] != want {
+			t.Errorf("%s: got %+v, want %+v", want.Path, got.Entries[0], want)
+		}
+	}
+}
+
+// Git refuses an index with a flag it does not know, and so does mgit:
+// rewriting the index would drop it.
+func TestParseRejectsUnknownFlags(t *testing.T) {
+	b := append([]byte(signature), 0, 0, 0, 3, 0, 0, 0, 1)
+	b = appendEntry(b, &Entry{Path: "a", Mode: ModeFile, SkipWorktree: true})
+	b[headerSize+entryFixedSize] |= 0x10 // flag 0x1000 of the second word
+	sum := sha1.Sum(b)
+	_, err := Parse(append(b, sum[:]...))
+	if err == nil || !strings.Contains(err.Error(), "unknown flags 0x5000") {
+		t.Errorf("Parse = %v, want an error about unknown flags 0x5000", err)
+	}
+}
+
 func TestEncodeRejectsBadEntries(t *testing.T) {
 	ix := &Index{Entries: []*Entry{{Path: "a"}, {Path: "a"}}}
 	if _, err := ix.Encode(); err == nil {

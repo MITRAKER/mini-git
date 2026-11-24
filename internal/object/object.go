@@ -48,6 +48,11 @@ const (
 	maxHeaderLen = 32
 	// MinAbbrev is the shortest hash prefix mgit accepts or prints.
 	MinAbbrev = 4
+	// DefaultAbbrev is how many characters of a hash Git prints by
+	// default, before it adds more to keep the prefix unique. (Git uses
+	// more in repositories with tens of thousands of packed objects;
+	// mgit does not read packs.)
+	DefaultAbbrev = 7
 	// maxDeflateRatio is the most zlib can compress data: about 1032 to 1.
 	// A header that claims more content than that is corrupt; checking it
 	// before allocating means a tiny hostile file cannot make mgit allocate

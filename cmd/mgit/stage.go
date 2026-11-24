@@ -18,6 +18,11 @@ import (
 // For each file: store its contents as a blob and record the blob in the
 // index. A folder adds everything inside it. A path that no longer exists on
 // disk is removed from the index, which stages the deletion.
+//
+// Like Git, add leaves alone the entries marked assume-unchanged or
+// skip-worktree (see leftAlone). A path that matches nothing but
+// skip-worktree entries is reported once the other paths are added, and the
+// command fails.
 func runAdd(args []string) error {
 	if len(args) == 0 {
 		return errors.New("nothing specified, nothing added (try 'mgit add .')")
@@ -30,45 +35,95 @@ func runAdd(args []string) error {
 	if err != nil {
 		return err
 	}
+	var sparse []string
 	for _, arg := range args {
-		if err := addPath(r, ix, arg); err != nil {
+		onlySparse, err := addPath(r, ix, arg)
+		if err != nil {
 			return err
+		}
+		if onlySparse {
+			sparse = append(sparse, arg)
 		}
 	}
 	status.CheckRacy(r, ix)
-	return ix.Write(r.IndexPath())
+	if err := ix.Write(r.IndexPath()); err != nil {
+		return err
+	}
+	if len(sparse) > 0 {
+		return fmt.Errorf("these paths are outside the sparse checkout (marked skip-worktree), "+
+			"so they were not updated in the index:\n%s", strings.Join(sparse, "\n"))
+	}
+	return nil
 }
 
-// addPath stages one path given on the command line.
-func addPath(r *repo.Repo, ix *index.Index, arg string) error {
+// leftAlone reports an entry that add and commit -a do not touch, as in Git:
+// one marked assume-unchanged (its file is taken to be unchanged) or
+// skip-worktree (its file is outside the sparse checkout).
+func leftAlone(e *index.Entry) bool { return e.AssumeUnchanged || e.SkipWorktree }
+
+// addPath stages one path given on the command line. onlySparse reports a
+// path that matched nothing but skip-worktree entries.
+func addPath(r *repo.Repo, ix *index.Index, arg string) (onlySparse bool, err error) {
 	rel, err := r.RelPath(arg)
 	if err != nil {
-		return err
+		return false, err
 	}
 	fi, err := os.Lstat(r.AbsPath(rel))
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return stageDeletion(ix, rel, arg)
 	case err != nil:
-		return err
+		return false, err
 	case fi.IsDir():
 		return addDir(r, ix, rel)
-	default:
-		return addFile(r, ix, rel, fi)
 	}
+	if e := ix.Get(rel); e != nil && leftAlone(e) {
+		return e.SkipWorktree, nil
+	}
+	return false, addFile(r, ix, rel, fi)
+}
+
+// pathEntries are the index entries at a path or in the folder it names.
+type pathEntries struct {
+	open    []*index.Entry // the entries add looks at
+	matched int            // the entries that are not skip-worktree
+	sparse  int            // the skip-worktree entries, which Git does not count as a match
+}
+
+// entriesAt finds the index entries at rel or under it; rel "" is the whole
+// repository.
+func entriesAt(ix *index.Index, rel string) pathEntries {
+	var pe pathEntries
+	for _, e := range ix.Entries {
+		if rel != "" && e.Path != rel && !strings.HasPrefix(e.Path, rel+"/") {
+			continue
+		}
+		if e.SkipWorktree {
+			pe.sparse++
+			continue
+		}
+		pe.matched++
+		if !e.AssumeUnchanged {
+			pe.open = append(pe.open, e)
+		}
+	}
+	return pe
 }
 
 // stageDeletion forgets a path that is gone from disk: a file, or every
 // tracked file under a deleted folder.
-func stageDeletion(ix *index.Index, rel, arg string) error {
-	removed := ix.RemoveUnder(rel + "/")
-	if ix.Remove(rel) {
-		removed++
+func stageDeletion(ix *index.Index, rel, arg string) (onlySparse bool, err error) {
+	at := entriesAt(ix, rel)
+	if at.matched == 0 {
+		if at.sparse > 0 {
+			return true, nil
+		}
+		return false, fmt.Errorf("pathspec '%s' did not match any files", arg)
 	}
-	if removed == 0 {
-		return fmt.Errorf("pathspec '%s' did not match any files", arg)
+	for _, e := range at.open {
+		ix.Remove(e.Path)
 	}
-	return nil
+	return false, nil
 }
 
 // addFile stores one file as a blob and records it in the index.
@@ -86,52 +141,47 @@ func addFile(r *repo.Repo, ix *index.Index, rel string, fi os.FileInfo) error {
 
 // addDir stages everything under the folder rel: new and changed files, and
 // the deletion of tracked files that are gone. Symbolic links are added as
-// links, never followed, the same as Git does.
-func addDir(r *repo.Repo, ix *index.Index, rel string) error {
-	if err := forgetDeleted(r, ix, rel); err != nil {
-		return err
+// links, never followed, the same as Git does. It returns true if rel
+// matched nothing but skip-worktree entries.
+func addDir(r *repo.Repo, ix *index.Index, rel string) (bool, error) {
+	at := entriesAt(ix, rel)
+	if err := forgetDeleted(r, ix, at.open); err != nil {
+		return false, err
 	}
 	files, err := r.ListFiles(rel)
 	if err != nil {
-		return err
+		return false, err
 	}
+	added := 0
 	for _, p := range files {
-		fi, err := os.Lstat(r.AbsPath(p))
-		if err != nil {
-			return err
-		}
-		if err := addFile(r, ix, p, fi); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// forgetDeleted removes the tracked files under the folder rel that are no
-// longer on disk.
-func forgetDeleted(r *repo.Repo, ix *index.Index, rel string) error {
-	prefix := ""
-	if rel != "" {
-		prefix = rel + "/"
-	}
-	var gone []string
-	for _, e := range ix.Entries {
-		if !strings.HasPrefix(e.Path, prefix) {
+		if e := ix.Get(p); e != nil && leftAlone(e) {
 			continue
 		}
+		fi, err := os.Lstat(r.AbsPath(p))
+		if err != nil {
+			return false, err
+		}
+		if err := addFile(r, ix, p, fi); err != nil {
+			return false, err
+		}
+		added++
+	}
+	return at.matched+added == 0 && at.sparse > 0, nil
+}
+
+// forgetDeleted removes the entries whose files are no longer on disk.
+func forgetDeleted(r *repo.Repo, ix *index.Index, entries []*index.Entry) error {
+	for _, e := range entries {
 		fi, found, err := r.StatTracked(e.Path)
 		switch {
 		case err != nil:
 			return err
 		case !found:
-			gone = append(gone, e.Path)
+			ix.Remove(e.Path)
 		case !repo.IsFileOrLink(fi.Mode()):
 			// ListFiles skips special files, so say why this one is not added.
 			return fmt.Errorf("%s: can only add regular files and symbolic links", e.Path)
 		}
-	}
-	for _, p := range gone {
-		ix.Remove(p)
 	}
 	return nil
 }

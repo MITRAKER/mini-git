@@ -37,6 +37,16 @@ func (o *output) write(b []byte) {
 	}
 }
 
+// Write prints bytes as they are, so that output is an io.Writer for the
+// packages that print (internal/patch). It returns the first error.
+func (o *output) Write(b []byte) (int, error) {
+	o.write(b)
+	if o.err != nil {
+		return 0, o.err
+	}
+	return len(b), nil
+}
+
 // flush prints what is still buffered and returns the first error.
 func (o *output) flush() error {
 	if o.err != nil {

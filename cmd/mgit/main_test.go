@@ -99,6 +99,7 @@ func TestExitStatus(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", exitError(3)), 3},
 		{flag.ErrHelp, exitUsage},
 		{usageError("mgit thing"), exitUsage},
+		{fmt.Errorf("unknown option \"-x\"\n%w", usageError("mgit thing")), exitUsage},
 		{errors.New("something broke"), exitFail},
 	}
 	for _, c := range cases {

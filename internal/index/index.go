@@ -5,8 +5,9 @@
 // information (size, modification time, ...). Git compares that stat copy with
 // the file on disk to tell, without reading the file, that it has not changed.
 //
-// This package writes the same binary format as Git (version 2), so the real
-// `git status` and `git ls-files` can read an index made by mgit.
+// This package writes the same binary format as Git (version 2, or 3 when an
+// entry carries the marks that need it), so the real `git status` and
+// `git ls-files` can read an index made by mgit.
 //
 // Layout (all integers are big-endian):
 //
@@ -52,6 +53,11 @@ type Entry struct {
 	Hash                object.Hash
 	Stage               uint16 // 0 normally; 1-3 during a merge conflict
 	Path                string // repository path with forward slashes
+
+	// Flags that git sets and mgit keeps. A new entry (NewEntry) has none.
+	AssumeUnchanged bool // `git update-index --assume-unchanged`: do not look at the file
+	SkipWorktree    bool // not checked out (sparse checkout, `--skip-worktree`)
+	IntentToAdd     bool // `git add -N`: the path is known, its contents not staged yet
 
 	// checked is true when this run of mgit made the entry from the file
 	// itself, or compared the file's contents with it (see CheckRacy): it
@@ -158,9 +164,14 @@ const (
 	// padding to 8 bytes. It bounds the number of entries a file can hold.
 	minEntrySize   = 64
 	flagNameMask   = 0x0fff
-	flagExtended   = 0x4000
 	flagStageShift = 12
 	maxStage       = 3
+	flagExtended   = 0x4000 // a second word of flags follows (version 3)
+	flagValid      = 0x8000 // assume unchanged
+	// The second word of flags. Git refuses an entry with any other bit.
+	flag2IntentToAdd  = 0x2000
+	flag2SkipWorktree = 0x4000
+	flag2Known        = flag2IntentToAdd | flag2SkipWorktree
 )
 
 // Read loads the index at path. A missing file is an empty index, which is
@@ -309,13 +320,20 @@ func parseEntry(b []byte) (*Entry, int, error) {
 	copy(e.Hash[:], b[40:60])
 	flags := binary.BigEndian.Uint16(b[60:62])
 	e.Stage = (flags >> flagStageShift) & maxStage
+	e.AssumeUnchanged = flags&flagValid != 0
 
 	nameStart := entryFixedSize
 	if flags&flagExtended != 0 { // version 3 adds 2 more flag bytes
 		nameStart += 2
-	}
-	if len(b) < nameStart {
-		return nil, 0, errors.New("truncated")
+		if len(b) < nameStart {
+			return nil, 0, errors.New("truncated")
+		}
+		flags2 := binary.BigEndian.Uint16(b[entryFixedSize:nameStart])
+		if flags2&^flag2Known != 0 {
+			return nil, 0, fmt.Errorf("unknown flags %#04x", flags2)
+		}
+		e.IntentToAdd = flags2&flag2IntentToAdd != 0
+		e.SkipWorktree = flags2&flag2SkipWorktree != 0
 	}
 	nul := bytes.IndexByte(b[nameStart:], 0)
 	if nul < 0 {
@@ -404,12 +422,20 @@ func (ix *Index) CommitLocked(lock *lockfile.Lock) error {
 }
 
 // Encode returns the bytes of the index file. It refuses to encode an index
-// with an invalid path, a bad stage or two entries for the same path.
+// with an invalid path, a bad stage or two entries for the same path. Like
+// Git, it writes version 2, or version 3 when an entry has flags that only
+// version 3 can hold.
 func (ix *Index) Encode() ([]byte, error) {
 	ix.sort()
+	version := uint32(2)
+	for _, e := range ix.Entries {
+		if e.flags2() != 0 {
+			version = 3
+		}
+	}
 	buf := make([]byte, 0, headerSize+len(ix.Entries)*minEntrySize+sha1.Size)
 	buf = append(buf, signature...)
-	buf = binary.BigEndian.AppendUint32(buf, 2)
+	buf = binary.BigEndian.AppendUint32(buf, version)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(len(ix.Entries))) //nolint:gosec // G115: bounded by memory, far below 2^32 entries
 
 	for i, e := range ix.Entries {
@@ -439,10 +465,32 @@ func appendEntry(buf []byte, e *Entry) []byte {
 	}
 	buf = append(buf, e.Hash[:]...)
 	nameLen := min(len(e.Path), flagNameMask) // long paths store 0xFFF and rely on the NUL
-	buf = binary.BigEndian.AppendUint16(buf, e.Stage<<flagStageShift|uint16(nameLen))
+	flags, flags2 := e.Stage<<flagStageShift|uint16(nameLen), e.flags2()
+	if e.AssumeUnchanged {
+		flags |= flagValid
+	}
+	if flags2 != 0 {
+		flags |= flagExtended
+	}
+	buf = binary.BigEndian.AppendUint16(buf, flags)
+	if flags2 != 0 {
+		buf = binary.BigEndian.AppendUint16(buf, flags2)
+	}
 	buf = append(buf, e.Path...)
 	written := len(buf) - start
 	return append(buf, make([]byte, paddedLen(written)-written)...)
+}
+
+// flags2 is the second word of flags of e, which only version 3 has.
+func (e *Entry) flags2() uint16 {
+	var f uint16
+	if e.IntentToAdd {
+		f |= flag2IntentToAdd
+	}
+	if e.SkipWorktree {
+		f |= flag2SkipWorktree
+	}
+	return f
 }
 
 // entryLess is Git's index order: by path, comparing raw bytes, then by stage.

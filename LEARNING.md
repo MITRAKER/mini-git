@@ -21,6 +21,7 @@ Contents
 - [Lesson 3: Commits and history (`commit`, `log`, `rev-parse`)](#lesson-3-commits-and-history)
 - [Lesson 4: Professional engineering (CI/CD, linters, NASA/JPL rules)](#lesson-4-professional-engineering)
 - [Lesson 5: Branches and checkout (`branch`, `checkout`)](#lesson-5-branches-and-checkout)
+- [Lesson 6: Seeing changes (`diff`)](#lesson-6-seeing-changes)
 - [How the code is tested](#how-the-code-is-tested)
 
 ---
@@ -286,7 +287,9 @@ Three details you only learn by building it:
   low 3 bits.)
 - **Flags.** The low 12 bits are the path length (capped at 0xFFF for very long
   paths), and bits 12-13 are the merge *stage*, which we will need for merge
-  conflicts.
+  conflicts. The top bits are marks that Git commands can set; version 3
+  of the format adds a second word of flags for more of them. Lesson 6.6
+  says what they mean, and why mgit must keep them.
 - **Checksum footer.** A SHA-1 of the whole file. `index.Parse` verifies it, so
   a truncated or corrupted index is detected instead of silently misread.
 
@@ -1601,11 +1604,473 @@ git checkout -- big.bin && mgit status
    on? Delete the branch with `git update-ref -d`, then try
    `git rebase --continue`: what goes wrong?
 
+## Lesson 6: Seeing changes
+
+Step 5 adds `mgit diff`, which shows line by line what changed. What it
+compares depends on what you give it:
+
+| Command | Compares | Shows |
+|---------|----------|-------|
+| `mgit diff` | the index with the working tree | what `add` would stage |
+| `mgit diff --cached [<commit>]` | HEAD (or the commit) with the index | what `commit` would record |
+| `mgit diff <commit>` | a commit with the working tree | everything since that commit |
+| `mgit diff <commit> <commit>`, or `<commit>..<commit>` | two commits | what changed between them |
+
+Paths after `--` limit the diff to some files or folders. `-U<n>` sets how
+many lines of context surround each change, `--name-only` and
+`--name-status` list the files instead of showing the changes, and
+`--exit-code` and `--quiet` make the exit status say whether anything
+changed (1) or not (0), for scripts.
+
+What mgit prints is, byte for byte, what `git diff` prints:
+
+```
+$ echo world >> hello.txt
+$ mgit diff
+diff --git a/hello.txt b/hello.txt
+index ce01362..94954ab 100644
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1,2 @@
+ hello
++world
+```
+
+That promise is the hard part. Two texts have many correct diffs, and Git
+prints one particular diff, chosen by its algorithm and a few heuristics.
+To print the same one, mgit follows Git's diff library, **xdiff**, step by
+step.
+
+| Code | What it does |
+|------|--------------|
+| `internal/diff` | compares two texts line by line, the way xdiff does |
+| `internal/patch/compare.go` | finds the files that differ between two snapshots |
+| `internal/patch/patch.go` | prints each file in Git's patch format |
+| `cmd/mgit/diff.go` | the `diff` command: sorts revisions, paths and options the way Git does |
+
+### 6.1 What a diff is
+
+A diff turns the old text into the new one with two kinds of edits: delete a
+line of the old text, or insert a line of the new one. The lines that stay
+are lines both texts have, in the same order: a *common subsequence*. The
+best diff keeps as many lines as it can, a *longest common subsequence*
+(LCS), and so makes the fewest edits.
+
+Take the old text `a b c a b b a` and the new text `c b a b a c` (one letter
+per line; this is the example in Eugene Myers' 1986 paper). Their longest
+common subsequences have four lines: `b a b a`, `c a b a` and `c b b a` all
+work. So the shortest diffs delete 3 lines and insert 2: 5 edits. There are
+several of them, and which one you see depends on the algorithm.
+
+The textbook way to find an LCS fills a table with one cell for each pair of
+lines: for two files of 10,000 lines, 100 million cells. Myers found a way
+whose cost grows with the number of edits instead, which is small when two
+versions of a file are alike: the usual case. Git uses it, and so does mgit.
+
+### 6.2 Myers' algorithm
+
+Picture the **edit graph**: the old text along the top, the new text down
+the side. You start at the top-left corner and must reach the bottom-right
+one. A step right deletes a line of the old text, a step down inserts a line
+of the new one, and where the two lines are equal you may also step
+diagonally, keeping the line, for free.
+
+```
+           a   b   c        old text: a step right deletes a line
+       o---o---o---o
+     b |   | \ |   |
+       o---o---o---o
+     c |   |   | \ |
+       o---o---o---o
+     d |   |   |   |
+       o---o---o---o        new text: a step down inserts a line
+```
+
+Every path from corner to corner is a diff, and its cost is its number of
+steps that are not diagonal. Here the cheapest path costs 2: right (delete
+`a`), diagonal (keep `b`), diagonal (keep `c`), down (insert `d`).
+
+Myers searches by cost. Number the diagonals `k = x - y`, where `x` counts
+the old lines passed and `y` the new ones. After `d` edits a path can only
+end on the diagonals `-d, -d+2, ..., d`, and on each of them it is enough to
+remember the point that got furthest. Round `d` extends each point of round
+`d-1` by one step, right or down, then follows the diagonal for as long as
+the lines match (a run of diagonal steps is called a *snake*). The first
+round that reaches the corner gives the length of the shortest diff:
+
+```go
+// shortest returns the fewest deletions and insertions that turn a into b.
+func shortest(a, b []string) int {
+	n, m := len(a), len(b)
+	offset := n + m + 1
+	v := make([]int, 2*offset+1) // v[offset+k]: the furthest x reached on diagonal k
+	for d := 0; d <= n+m; d++ {
+		for k := -d; k <= d; k += 2 {
+			var x int
+			if k == -d || (k != d && v[offset+k-1] < v[offset+k+1]) {
+				x = v[offset+k+1] // down from diagonal k+1: insert a line of b
+			} else {
+				x = v[offset+k-1] + 1 // right from diagonal k-1: delete a line of a
+			}
+			y := x - k
+			for x < n && y < m && a[x] == b[y] { // follow the snake
+				x, y = x+1, y+1
+			}
+			v[offset+k] = x
+			if x >= n && y >= m {
+				return d
+			}
+		}
+	}
+	return n + m
+}
+```
+
+For `a b c a b b a` and `c b a b a c` it returns 5. The work is about
+`(n + m) × d` steps, and two versions of a file usually differ by a small
+`d`.
+
+This finds the cost of the best path, not the path. Keeping the points of
+every round would take memory that grows like `d²`, so Myers runs the
+search from both corners at once, forward from the top-left and backward
+from the bottom-right, until the two meet. Where they meet, the *middle
+snake*, lies on a shortest path, and it cuts the grid into two smaller
+boxes, each solved the same way. Git's `xdl_recs_cmp` does that by calling
+itself; mgit keeps a stack of the boxes still to solve (`compare` in
+`myers.go`), because the coding standard allows no recursion (lesson 4.3).
+Each box is cut into two strictly smaller ones, which gives the loop its
+bound: a grid of `n` lines has fewer than `2n + 1` boxes.
+
+### 6.3 What Git does around the algorithm
+
+Before the search, Git prepares the texts (`prepare.go`; xdiff's
+`xprepare.c`):
+
+1. **Lines become numbers.** Each distinct line gets a number, its *class*,
+   so that comparing two lines is comparing two integers. A line includes
+   its `\n`, so a last line without one differs from the same line with
+   one: that is why a patch can say `\ No newline at end of file`.
+2. **The shared start and end are skipped.** Most edits touch a small part
+   of a file, so the search only sees what lies between.
+3. **Lines that cannot match are set aside.** A line the other text does
+   not have at all was surely deleted, or inserted: the search need not see
+   it. Nor does a line the other text has very many copies of, such as a
+   blank line or a lone `}`, when it sits among unmatched lines: matching it
+   would only stitch unrelated blocks together.
+
+During the search, Git takes **shortcuts** (`myers.go`; `xdl_split`). The
+search costs more as `d` grows, so when two texts are very different, Git
+stops looking for the very shortest diff: past a cost of about the square
+root of the texts' size (at least 256), it cuts where its search got
+furthest. In files of over 32,768 lines each, it first looks for a cut on a
+long run of matching lines. The result can be a few lines longer than the
+shortest diff, but it is Git's diff, so mgit takes the same shortcuts at the
+same moments.
+
+After the search, Git **slides** each block of changed lines to where a
+person would put it (`slide.go`, 6.4), and prints the hunks (`unified.go`,
+6.5).
+
+### 6.4 Sliding changes to where they belong
+
+A block of changed lines can often move without changing the diff. Add a
+comment above another one:
+
+```
+/*                         /*
+ * Something old.           * Something new.
+ */                         */
+
+                           /*
+                            * Something old.
+                            */
+```
+
+Both diffs below add the same four lines, and are equally short. A search
+pushes the block down as far as it goes, which gives:
+
+```
+@@ -1,3 +1,7 @@
+ /*
++ * Something new.
++ */
++
++/*
+  * Something old.
+  */
+```
+
+Git prints:
+
+```
+@@ -1,3 +1,7 @@
++/*
++ * Something new.
++ */
++
+ /*
+  * Something old.
+  */
+```
+
+It decides in two steps (`xdl_change_compact`):
+
+1. A block slides up while its last line equals the line above it, and down
+   while its first line equals the line below it, joining any block it
+   meets. If it can reach a change in the other text, it goes there, so that
+   a replaced line shows as a deletion right next to its insertion.
+2. Otherwise the **indent heuristic** (Git's default since 2.14) scores each
+   place the block can go by the two cuts it makes, above and below the
+   block. Blank lines at a cut are good, and the indentation of the lines
+   around it tells whether the cut falls between two blocks of code or
+   splits one. The weights come from thousands of real diffs that people
+   judged by hand. The lowest score wins: here, the cuts before the two
+   `/*` lines.
+
+mgit ports the weights and the scoring as they are (`score.add` in
+`slide.go`). You can see the first diff with
+`git diff --no-indent-heuristic`.
+
+### 6.5 The patch format
+
+```
+diff --git a/sum.c b/sum.c
+index 9c7fba5..bcff1a7 100644
+--- a/sum.c
++++ b/sum.c
+@@ -5,7 +5,7 @@ int main(void)
+ 	int total = 0;
+ 
+ 	for (int i = 0; i < 10; i++)
+-		total += i;
++		total += i * i;
+ 	printf("%d\n", total);
+ 	return 0;
+ }
+```
+
+- `diff --git a/sum.c b/sum.c` names the file on both sides.
+- `index 9c7fba5..bcff1a7 100644` gives the hashes of the blob before and
+  after, shortened to 7 characters, and the mode when it did not change. A
+  new file shows `new file mode 100644` and `0000000` before; a deleted one
+  `deleted file mode`; a new mode `old mode` and `new mode`. When only the
+  mode changed, the header is all there is.
+- `---` and `+++` name the two sides again, with `/dev/null` for a side that
+  has no such file.
+- Each **hunk** starts with `@@ -5,7 +5,7 @@`: it covers 7 lines from line 5
+  of the old file, and 7 lines from line 5 of the new one. A count of 1 is
+  left out (`@@ -1 +1,2 @@`), and an empty side gives the line before it
+  (`-2,0`).
+- Then come the lines: a space for a line both have (context), `-` for a
+  deleted line and `+` for an inserted one. Each change gets 3 lines of
+  context (`-U<n>` changes that), and two changes share a hunk when no more
+  than 6 lines, twice the context, separate them.
+- After the second `@@` comes the **function name**: the nearest line above
+  the hunk that starts with a letter, `_` or `$`, which in most languages is
+  the line that starts a function. Git keeps 80 bytes of it, drops the
+  spaces at its end, and cuts the header at the first byte that is not valid
+  UTF-8, so a broken file cannot break your terminal. (`.gitattributes` can
+  tell Git how to find functions in each language; mgit always uses this
+  default.)
+
+Some files get no hunks:
+
+- A file with a NUL byte in its first 8,000 bytes is **binary**: Git only
+  says `Binary files a/data.bin and b/data.bin differ`.
+- A file that became a symbolic link (a type change, `T`) is shown as the
+  deletion of the one and the creation of the other: no patch can turn a
+  file into a link.
+
+File names are quoted as in `status` (lesson 2), and a name with a space
+gets a tab after it on the `---` and `+++` lines, so that a tool can tell
+where the name ends.
+
+### 6.6 Which snapshots `diff` compares
+
+Lesson 2.5 showed the three snapshots: HEAD, the index and the working tree.
+`internal/patch/compare.go` turns each into a list of files and compares
+two of them. A few rules, all Git's:
+
+- **Only tracked files.** An untracked file never shows in a diff; `status`
+  lists those.
+- **The stat cache again** (lesson 2.6). `mgit diff` reads a file only when
+  its size or times differ from what the index recorded, or when the index
+  cannot vouch for it (racy git). A file that was touched but not changed
+  shows nothing.
+- **`diff <commit>` looks at the working tree through the index.** A file in
+  the commit that you removed from the index counts as deleted, even if it
+  is still on disk; a file you added and then deleted from the disk does not
+  show at all.
+- **Revision or path?** In `mgit diff main f`, is `f` a branch or a file?
+  As in Git, each argument before `--` that names a revision is one, and the
+  first one that does not starts the paths. Without `--`, a name must not
+  be both a revision and a file, and a path must exist, so that a mistyped
+  branch name is not taken for a path. Both mistakes are errors that tell
+  you to use `--`.
+- **Output options.** `--name-only` and `--name-status` replace the patch,
+  even after `-p`, and Git refuses the two together. `--quiet` prints
+  nothing and sets the exit status.
+- **Marks on index entries.** Git can mark an entry of the index.
+  `git add -N` records a path without its contents (an "intent to add"):
+  `diff` shows the whole file as new, and a commit leaves it out until it
+  is added for real. `git update-index --assume-unchanged` and
+  `--skip-worktree` tell Git not to look at a file: `diff`, `status`, `add`
+  and `commit -a` leave it alone. mgit has no commands that set these marks,
+  but it reads them in an index that Git wrote (the second word of flags,
+  which is why such an index is version 3), keeps them when it writes the
+  index, and follows the same rules. A first version of this step dropped
+  them every time it wrote the index, which silently undid a `git add -N`.
+
+### 6.7 What mgit leaves out
+
+Git's `diff` does much more. What mgit cannot show yet, it refuses, rather
+than print something different from Git:
+
+- **Renames.** Git looks for renamed files (by default since Git 2.9). mgit
+  shows a rename as a deletion and an addition, which is what
+  `git diff --no-renames` prints. Its tests turn rename detection off in Git
+  (`diff.renames=false`).
+- **Refused, with a message:** `A...B` (a diff from the merge base), three
+  or more commits (a combined diff), two blobs, and a file in the middle of
+  a merge conflict.
+- **Not there:** options such as `--stat`, `-R`, `-w`, `--word-diff`,
+  `--color` and `--no-index`; diff drivers in `.gitattributes`; and changes
+  inside submodules.
+- Hashes are always shortened to 7 characters. Git uses more in very large
+  repositories, where 7 characters stop being unique.
+
+### 6.8 How it was tested, and a bug a fuzzer found
+
+Three kinds of tests check `diff`:
+
+1. **The engine against Git** (`e2e/diff_engine_test.go`): thousands of
+   random pairs of texts, each compared with what `git diff --no-index`
+   prints, byte for byte. Purely random texts would rarely reach the rare
+   paths, so each generator aims at one: a few distinct lines (many places
+   to slide a block), code with indentation and blank lines (the indent
+   heuristic), lines repeated hundreds of times (set aside before the
+   search), long shuffled texts (the cost limit), texts of over 32,768
+   lines (the long-run shortcut), and function lines that are long or not
+   valid UTF-8. To make sure the shortcuts really ran, counters added for
+   one run showed the cost limit cut 127 times, and the long-run shortcut
+   95 times.
+2. **The command against Git, in twins** (`e2e/diff_test.go`, as in lesson
+   5.7): 27 situations, each with 12 ways of calling `diff`; revisions,
+   ranges and paths, and their mistakes; quoted names; function names; and
+   40 rounds of random edits, deletions, new modes, symbolic links, staging
+   and commits. `e2e/flags_test.go` does the same for the marks on index
+   entries, with `status`, `add` and `commit -a` too.
+3. **Properties, and a fuzzer** (`internal/diff/diff_test.go`). Some things
+   must hold for any two texts: the changes `Lines` finds turn the old text
+   into the new one, and so do the hunks `Unified` prints, applied like a
+   patch. Go's fuzzer (`go test -fuzz`) feeds `FuzzDiff` inputs that it
+   keeps changing to reach new code.
+
+The fuzzer found a bug within twenty seconds. For the texts `"\n\n\n0"` and
+`"0\n\n\n\n\n"`, mgit failed with `diff: more groups than lines`. That error
+comes from one of the loop bounds that the coding standard asks for (rule 2):
+the walk over the blocks of changed lines in `compact` was to meet at most
+one block per line, so a longer walk had to be a bug. But the bound itself
+was wrong. A block that slides up can join the blocks above it, and the walk
+then goes back over lines it had already passed:
+
+```
+new text    changed before    changed after
+0           yes               yes   ┐ the second block slid up
+(blank)                       yes   ┘ and joined the first
+(blank)
+(blank)
+(blank)     yes
+```
+
+Git puts no bound on this loop. It ends because the walk meets each block
+once, and that is what mgit's loop now counts: the blocks with changed
+lines, while a second loop (`nextChanged`) bounds the steps between two of
+them. The fuzzer saved its input in `internal/diff/testdata/fuzz/FuzzDiff`,
+where every `go test` runs it again, and the comparison with Git has it too.
+The lesson: a bound is a claim about your code. It needs a reason, like the
+code it guards, and a fuzzer is good at testing such claims.
+
+### Try it
+
+```sh
+mkdir diff-demo && cd diff-demo && mgit init
+git config user.name "Your Name" && git config user.email "you@example.com"
+printf 'hello\n' > hello.txt
+printf 'int main(void)\n{\n\tint total = 0;\n\n\tfor (int i = 0; i < 10; i++)\n\t\ttotal += i;\n\treturn total;\n}\n' > sum.c
+mgit add . && mgit commit -m "First"
+
+echo world >> hello.txt
+sed -i.bak 's/total += i;/total += i * i;/' sum.c && rm sum.c.bak
+mgit diff                            # the function name after the @@
+mgit diff -U0                        # no context
+mgit add hello.txt
+mgit diff                            # only sum.c: hello.txt is staged
+mgit diff --cached                   # only hello.txt
+mgit diff HEAD --name-status         # both
+mgit commit -a -m "Second"
+mgit diff HEAD~1 HEAD -- sum.c       # between two commits, one file
+mgit diff HEAD~1..HEAD --name-only
+
+# The same bytes as git
+cmp <(mgit diff HEAD~1 HEAD) <(git diff HEAD~1 HEAD) && echo same
+
+# The exit status, for scripts
+mgit diff --quiet; echo $?           # 0: nothing changed
+echo more >> hello.txt
+mgit diff --quiet; echo $?           # 1
+
+# Binary files, modes and links
+printf 'a\0b' > data.bin && mgit add data.bin && mgit commit -m "Binary"
+printf 'a\0c' > data.bin && mgit diff data.bin
+chmod +x sum.c && mgit diff sum.c    # old mode, new mode
+ln -s hello.txt link && mgit add link && mgit diff --cached link
+
+# The sliding example of 6.4
+printf '/*\n * Something old.\n */\n' > old.c
+printf '/*\n * Something new.\n */\n\n/*\n * Something old.\n */\n' > new.c
+git diff --no-index old.c new.c
+git diff --no-index --no-indent-heuristic old.c new.c
+
+# A revision, or a path?
+mgit diff nothing-there              # neither: an error
+mgit branch sum.c && mgit diff sum.c # both: an error that asks for --
+mgit diff -- sum.c
+```
+
+### Exercises
+
+1. **Draw it.** Draw the edit graph of `a b c a b b a` and `c b a b a c`.
+   Run `shortest` by hand, marking the furthest point of each diagonal
+   after each round. In which round is the corner reached, and by which
+   path?
+2. **Renames.** When a deleted file and an added file are similar enough
+   (Git's default is half their contents the same), show them as one
+   rename, with `similarity index`, `rename from` and `rename to`. Compare
+   with `git diff -M`. What does it cost when a commit deletes a thousand
+   files and adds a thousand?
+3. **`--stat`.** Print one line per file with the number of lines added and
+   deleted and a bar of `+` and `-`, then the totals, like
+   `git diff --stat`.
+4. **`-R`.** Swap the two sides. Which parts of the header change, besides
+   the signs?
+5. **Patience diff.** `git diff --patience` first matches the lines that
+   appear exactly once in each text, then fills in between them. Write it,
+   and find a file where its diff reads better than Myers'.
+6. **Break it on purpose.** In `bestShift` (`slide.go`), change
+   `s.cmp(best) <= 0` to `s.cmp(best) < 0`, then run
+   `go test ./internal/diff ./e2e`. Which tests fail, and which do not? Why
+   can no property test catch this change?
+7. **Fuzz it.** Run `go test ./internal/diff -run '^$' -fuzz FuzzDiff
+   -fuzztime 1m`. Then move the saved input out of `testdata`, make
+   `compact` call `t.next` for every group again with one bound for all of
+   them, and see how long the fuzzer takes to find the bug of 6.8.
+
 ---
 
 ## How the code is tested
 
-There are two layers of tests (`go test ./...`, or `make test`):
+There are three kinds of tests (`go test ./...`, or `make test`):
 
 - **Unit tests** next to the code (`*_test.go`) check one piece at a time:
   known hashes, round-tripping an object or an index through write and read,
@@ -1621,7 +2086,14 @@ There are two layers of tests (`go test ./...`, or `make test`):
   tree and commit matches. The tests for branches and checkout go one step
   further with *twins*: the same repository twice, git in one copy and mgit
   in the other, and both must end up identical
-  ([lesson 5.7](#57-testing-against-git-twice)).
+  ([lesson 5.7](#57-testing-against-git-twice)). The diff engine is also
+  compared with `git diff --no-index` on thousands of random pairs of texts
+  ([lesson 6.8](#68-how-it-was-tested-and-a-bug-a-fuzzer-found)).
+- **Fuzz tests** check properties that hold for any input: for example,
+  that the hunks of a diff, applied like a patch, turn the old text into
+  the new one. `go test` runs them on the inputs saved in `testdata`, and
+  `go test -fuzz=FuzzDiff ./internal/diff` makes up new inputs for as long
+  as you let it.
 
 Using an existing, trusted program as the answer key is called *differential
 testing* (or using a "test oracle"). It is how you test a re-implementation:
@@ -1629,12 +2101,11 @@ you do not need to work out the right answer by hand, you only need to agree
 with Git.
 
 GitHub Actions runs all of it on every pull request, on Linux and macOS, with
-the race detector, and measures coverage across both layers
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml), explained in
-[lesson 4](#lesson-4-professional-engineering)). `make check` runs the same
-checks on your machine.
+the race detector, and measures the coverage of the unit and end-to-end
+tests together ([`.github/workflows/ci.yml`](.github/workflows/ci.yml),
+explained in [lesson 4](#lesson-4-professional-engineering)). `make check`
+runs the same checks on your machine.
 
 ---
 
-*Next: step 5, `mgit diff`, which shows line by line what changed between
-two versions of a file.*
+*Next: step 6, the stretch goals: `merge`, `.gitignore` and tags.*
