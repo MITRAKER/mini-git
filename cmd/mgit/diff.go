@@ -138,19 +138,20 @@ func (o *diffOptions) format() patch.Format {
 
 // setContext reads the number of -U<n> as Git does: with C's strtol, so
 // leading white space and a sign are allowed and "" is 0, then kept in a C
-// int, which keeps the low 32 bits, so 4294967299 is 3. A number that ends
-// up negative makes Git print broken hunk headers; mgit refuses it.
+// int, which keeps the low 32 bits, so 4294967299 is 3. A number whose low
+// 32 bits make a negative int (the top one of them is set) makes Git print
+// broken hunk headers; mgit refuses it.
 func (o *diffOptions) setContext(v string) error {
 	n, rest, _ := cStrtol(v)
 	if rest != "" {
 		return fmt.Errorf("-U needs a number of lines, not %q\n%w", v, usageError(diffUsage))
 	}
-	c := int32(n) //nolint:gosec // G115: Git keeps only the low 32 bits, and so must mgit
-	if c < 0 {
+	low := n & math.MaxUint32 // the low 32 bits, as a C int keeps them
+	if low > math.MaxInt32 {
 		return fmt.Errorf("-U%s: git would print broken hunk headers; use a number from 0 to %d\n%w",
 			v, math.MaxInt32, usageError(diffUsage))
 	}
-	o.context = min(int(c), maxContext)
+	o.context = min(int(low), maxContext)
 	return nil
 }
 
