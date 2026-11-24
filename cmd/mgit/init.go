@@ -1,20 +1,20 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-
 	"github.com/MITRAKER/mini-git/internal/repo"
 )
 
 // mgit init [<directory>]
-func runInit(args []string) error {
-	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+func runInit(args []string, out *output) error {
+	fs := newFlagSet("init")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 1 {
+		return usageError("mgit init [<directory>]")
+	}
 	dir := "."
-	if fs.NArg() > 0 {
+	if fs.NArg() == 1 {
 		dir = fs.Arg(0)
 	}
 	r, existed, err := repo.Init(dir)
@@ -22,9 +22,9 @@ func runInit(args []string) error {
 		return err
 	}
 	if existed {
-		fmt.Printf("Reinitialized existing Git repository in %s/\n", r.GitDir)
+		out.printf("Reinitialized existing Git repository in %s/\n", r.GitDir)
 	} else {
-		fmt.Printf("Initialized empty Git repository in %s/\n", r.GitDir)
+		out.printf("Initialized empty Git repository in %s/\n", r.GitDir)
 	}
 	return nil
 }

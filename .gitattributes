@@ -1,0 +1,39 @@
+# How Git treats the files in this repository.
+# https://git-scm.com/docs/gitattributes
+
+# Store text files with LF line endings, and check them out with LF on every
+# platform, Windows included. Go tools and the tests expect LF.
+* text=auto eol=lf
+
+# Show the enclosing Go function or Markdown heading in diff hunk headers.
+*.go diff=golang
+*.md diff=markdown
+
+# Test fixtures must stay byte-for-byte as committed, because mgit reads and
+# writes exact on-disk formats: never convert their line endings.
+**/testdata/** -text
+
+# Binary files: never convert line endings, never diff them as text.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tgz   binary
+*.tar   binary
+*.xz    binary
+*.zst   binary
+*.7z    binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.wasm  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary

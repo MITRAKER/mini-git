@@ -13,8 +13,8 @@ func fillStat(e *Entry, fi os.FileInfo) {
 		fillPortable(e, fi)
 		return
 	}
-	e.CtimeSec, e.CtimeNsec = uint32(st.Ctimespec.Sec), uint32(st.Ctimespec.Nsec)
-	e.MtimeSec, e.MtimeNsec = uint32(st.Mtimespec.Sec), uint32(st.Mtimespec.Nsec)
-	e.Dev, e.Ino = uint32(st.Dev), uint32(st.Ino)
+	e.CtimeSec, e.CtimeNsec = low32(st.Ctimespec.Sec), low32(st.Ctimespec.Nsec)
+	e.MtimeSec, e.MtimeNsec = low32(st.Mtimespec.Sec), low32(st.Mtimespec.Nsec)
+	e.Dev, e.Ino = low32(int64(st.Dev)), low32u(st.Ino)
 	e.UID, e.GID = st.Uid, st.Gid
 }
