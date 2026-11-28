@@ -94,7 +94,6 @@ func TestListFiles(t *testing.T) {
 	r := newTestRepo(t)
 	write(t, r.AbsPath("b.txt"), "b")
 	write(t, r.AbsPath("dir/a.txt"), "a")
-	write(t, r.AbsPath("dir/sub/.git/config"), "a nested repository's files")
 	write(t, r.AbsPath("dir/sub/c.txt"), "c")
 	if err := os.Mkdir(r.AbsPath("empty"), 0o755); err != nil {
 		t.Fatal(err)
@@ -113,6 +112,30 @@ func TestListFiles(t *testing.T) {
 	}
 	if files, err = r.ListFiles("dir/sub"); err != nil || strings.Join(files, " ") != "dir/sub/c.txt" {
 		t.Errorf("ListFiles(dir/sub) = %q, %v", files, err)
+	}
+	// A folder with a .git of its own is another repository: refused.
+	write(t, r.AbsPath("dir/sub/.git/config"), "a nested repository's files")
+	for _, from := range []string{"", "dir", "dir/sub"} {
+		if files, err := r.ListFiles(from); !errors.Is(err, ErrNestedRepo) {
+			t.Errorf("ListFiles(%q) = %q, %v; want ErrNestedRepo", from, files, err)
+		}
+	}
+}
+
+func TestFolderAt(t *testing.T) {
+	r := newTestRepo(t)
+	write(t, r.AbsPath("file"), "x")
+	write(t, r.AbsPath("plain/f"), "x")
+	write(t, r.AbsPath("nested/.git/HEAD"), "ref: refs/heads/main\n")
+	if err := os.Mkdir(r.AbsPath("empty"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]Folder{
+		"file": NoFolder, "missing": NoFolder, "plain": PlainFolder, "empty": PlainFolder, "nested": RepoFolder,
+	} {
+		if got, err := r.FolderAt(rel); err != nil || got != want {
+			t.Errorf("FolderAt(%q) = %v, %v; want %v", rel, got, err, want)
+		}
 	}
 }
 

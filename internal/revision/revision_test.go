@@ -87,6 +87,7 @@ func newHistory(t *testing.T) *history {
 
 func TestResolve(t *testing.T) {
 	h := newHistory(t)
+	t.Chdir(h.r.WorkTree) // "./" paths are from the current folder
 	cases := map[string]object.Hash{
 		"HEAD":                   h.merge,
 		"@":                      h.merge,
@@ -115,7 +116,10 @@ func TestResolve(t *testing.T) {
 		"HEAD:":                  h.root,
 		"HEAD:dir":               h.sub,
 		"HEAD:dir/file.txt":      h.blob,
+		"HEAD:dir/":              h.sub, // a "/" may end a folder's path
 		"v1:./README":            h.blob,
+		"HEAD:./":                h.root,
+		"HEAD:./dir/../README":   h.blob,
 		h.root.String() + ":dir": h.sub,
 	}
 	for name, want := range cases {
@@ -128,6 +132,7 @@ func TestResolve(t *testing.T) {
 
 func TestResolveErrors(t *testing.T) {
 	h := newHistory(t)
+	t.Chdir(h.r.WorkTree)
 	for name, wantText := range map[string]string{
 		"":                  "empty",
 		"nope":              "unknown revision",
@@ -140,9 +145,30 @@ func TestResolveErrors(t *testing.T) {
 		"HEAD^{":            "missing '}'",
 		"HEAD^{blob}":       "not a blob",
 		"HEAD:missing":      "does not exist",
-		"HEAD:README/x":     "not a folder",
+		"HEAD:README/x":     "does not exist",
 		"HEAD:dir/nope.txt": "does not exist",
 		":not-staged":       "not in the index",
+		// Anything but "~" or "^" after a step (Git: unknown revision).
+		"HEAD~x":   "unexpected",
+		"HEAD~1x":  "unexpected",
+		"HEAD~+1":  "unexpected",
+		"HEAD^foo": "unexpected",
+		"HEAD^-1":  "unexpected",
+		"HEAD^!":   "unexpected",
+		"HEAD^@":   "unexpected",
+		// Paths are taken as they are, unless they start with ./ or ../.
+		"HEAD:/dir":           "does not exist",
+		"HEAD:.":              "does not exist",
+		"HEAD:..":             "does not exist",
+		"HEAD:dir/.":          "does not exist",
+		"HEAD:dir//file.txt":  "does not exist",
+		"HEAD:dir//":          "does not exist",
+		"HEAD:README/":        "does not exist", // a file is not a folder
+		"HEAD:../README":      "outside repository",
+		":../staged.txt":      "outside repository",
+		"HEAD:dir/../README":  "does not exist",
+		":dir/../staged.txt":  "not in the index",
+		"HEAD:./dir/../../xx": "outside repository",
 	} {
 		got, err := Resolve(h.r, name)
 		if err == nil {
@@ -164,10 +190,58 @@ func TestResolveFromIndex(t *testing.T) {
 	if err := ix.Write(h.r.IndexPath()); err != nil {
 		t.Fatal(err)
 	}
+	t.Chdir(h.r.WorkTree)
 	for _, name := range []string{":staged.txt", ":./staged.txt"} {
 		if got, err := Resolve(h.r, name); err != nil || got != h.blob {
 			t.Errorf("Resolve(%q) = %s, %v", name, got, err)
 		}
+	}
+}
+
+// TestRelativePaths runs in a subfolder, where "./" and "../" start there.
+func TestRelativePaths(t *testing.T) {
+	h := newHistory(t)
+	sub := filepath.Join(h.r.WorkTree, "dir")
+	if err := os.Mkdir(sub, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+	for name, want := range map[string]object.Hash{
+		"HEAD:./":         h.sub,
+		"HEAD:./file.txt": h.blob,
+		"HEAD:../README":  h.blob,
+		"HEAD:../dir/":    h.sub,
+		"HEAD:../":        h.root,
+		"HEAD:file.txt":   {}, // not relative: from the top, where it does not exist
+	} {
+		got, err := Resolve(h.r, name)
+		if want == (object.Hash{}) {
+			if err == nil {
+				t.Errorf("Resolve(%q) = %s, want an error", name, got)
+			}
+			continue
+		}
+		if err != nil || got != want {
+			t.Errorf("Resolve(%q) = %s, %v; want %s", name, got, err, want)
+		}
+	}
+	t.Chdir(filepath.Join(h.r.WorkTree, ".git"))
+	if _, err := Resolve(h.r, "HEAD:./README"); err == nil || !strings.Contains(err.Error(), "outside working tree") {
+		t.Errorf("Resolve inside .git: error = %v, want it to mention the working tree", err)
+	}
+}
+
+func TestResolveRefusesUnmergedIndexEntries(t *testing.T) {
+	h := newHistory(t)
+	ix := &index.Index{}
+	if err := ix.Set(&index.Entry{Path: "f", Mode: index.ModeFile, Hash: h.blob, Stage: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Write(h.r.IndexPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Resolve(h.r, ":f"); err == nil || !strings.Contains(err.Error(), "stage 0") {
+		t.Errorf("Resolve(:f) error = %v, want it to mention stage 0", err)
 	}
 }
 

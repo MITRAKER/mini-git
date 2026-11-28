@@ -105,9 +105,18 @@ The bounds in mgit, each far above what a real repository needs:
 | `revision.maxTagChain` | 64 | annotated tags followed in a row |
 | `revision.maxGenerations` | 16,777,216 | the `n` in `HEAD~n` |
 
+Some loops are bounded by the size of their input instead, with the reason
+written next to the bound. The diff engine (internal/diff) works on two texts
+already in memory, and each of its loops is bounded by their number of lines:
+`compare` cuts the texts into boxes, each strictly smaller than the box it
+came from, so `n` lines make fewer than `2n + 1` boxes, and a block of
+changed lines slides at most `n` lines. A wrong reason makes a wrong bound:
+the fuzz test found one (lesson 6.9 of LEARNING.md).
+
 **Enforced by:** review, helped by `intrange` and `copyloopvar` (which keep
 loops in their simplest form) and by tests that feed loops their worst input,
-such as `TestResolveRef` (a ref loop) and `TestPeelFollowsTagChainsWithALimit`.
+such as `TestResolveRef` (a ref loop), `TestPeelFollowsTagChainsWithALimit`
+and `FuzzDiff`.
 
 ## Rule 3: Predictable memory
 

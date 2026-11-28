@@ -27,11 +27,15 @@ const (
 // but a tree lists only one folder. So every folder becomes its own tree
 // object, and its parent lists it by name with mode 40000 and its hash.
 // A parent needs its subfolders' hashes, so the deepest folders are written
-// first.
+// first. Like Git, it leaves out the entries added with `git add -N`, whose
+// contents are not staged yet.
 func WriteTree(store *object.Store, entries []*index.Entry) (object.Hash, error) {
 	files := map[string][]object.TreeEntry{} // folder -> files directly inside it
 	folders := newFolderSet()
 	for _, e := range entries {
+		if e.IntentToAdd && !e.SkipWorktree {
+			continue
+		}
 		if e.Stage != 0 {
 			return object.Hash{}, fmt.Errorf("%s has an unresolved merge conflict", e.Path)
 		}

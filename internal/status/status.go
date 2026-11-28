@@ -101,9 +101,14 @@ func (s changeSet) get(p string) *Change {
 	return c
 }
 
-// compareHeadToIndex finds what the next commit would change.
+// compareHeadToIndex finds what the next commit would change. An entry
+// added with `git add -N` has nothing staged yet: like Git, the next commit
+// leaves it out.
 func (s changeSet) compareHeadToIndex(committed map[string]history.File, ix *index.Index) {
 	for _, e := range ix.Entries {
+		if e.IntentToAdd {
+			continue
+		}
 		old, ok := committed[e.Path]
 		switch {
 		case !ok:
@@ -115,15 +120,20 @@ func (s changeSet) compareHeadToIndex(committed map[string]history.File, ix *ind
 		}
 	}
 	for p := range committed {
-		if ix.Get(p) == nil {
+		if e := ix.Get(p); e == nil || e.IntentToAdd {
 			s.get(p).Staged = Deleted
 		}
 	}
 }
 
 // compareIndexToWorktree finds edits you have not staged with `add` yet.
+// Like Git, it does not look at the files marked --assume-unchanged or
+// --skip-worktree.
 func (s changeSet) compareIndexToWorktree(r *repo.Repo, ix *index.Index) error {
 	for _, e := range ix.Entries {
+		if e.AssumeUnchanged || e.SkipWorktree {
+			continue
+		}
 		code, err := worktreeChange(r, ix, e)
 		if err != nil {
 			return err
@@ -135,7 +145,8 @@ func (s changeSet) compareIndexToWorktree(r *repo.Repo, ix *index.Index) error {
 	return nil
 }
 
-// worktreeChange compares one index entry with the file on disk.
+// worktreeChange compares one index entry with the file on disk. A file
+// added with `git add -N` is all new: nothing of it is staged yet.
 func worktreeChange(r *repo.Repo, ix *index.Index, e *index.Entry) (byte, error) {
 	w, err := ReadWorktree(r, ix, e)
 	switch {
@@ -143,6 +154,8 @@ func worktreeChange(r *repo.Repo, ix *index.Index, e *index.Entry) (byte, error)
 		return Unchanged, err
 	case !w.Exists:
 		return Deleted, nil
+	case e.IntentToAdd:
+		return Added, nil
 	case !index.SameKind(w.Mode, e.Mode):
 		return TypeChanged, nil
 	case w.Mode != e.Mode || w.Hash != e.Hash:
@@ -158,17 +171,41 @@ type Worktree struct {
 	Hash   object.Hash // the blob hash of its contents; zero for a special file
 }
 
+// Missing tells what it means when the tracked path of the entry e has no
+// file on disk (repo.Repo.StatTracked): unchanged is true for a submodule
+// that is not checked out, an empty folder at the path of a submodule
+// entry, which Git does not count as deleted. Otherwise the file was
+// deleted, or a folder took its place. A folder that holds a repository is
+// an error that wraps repo.ErrNestedRepo.
+func Missing(r *repo.Repo, e *index.Entry) (unchanged bool, err error) {
+	f, err := r.FolderAt(e.Path)
+	switch {
+	case err != nil:
+		return false, err
+	case f == repo.RepoFolder:
+		return false, fmt.Errorf("%s %w", e.Path, repo.ErrNestedRepo)
+	}
+	return f == repo.PlainFolder && e.Mode == index.ModeSubmodule, nil
+}
+
 // ReadWorktree looks at the file on disk for the entry e of the index ix.
 // When the file's stat information shows that it is unchanged
 // (ix.UpToDate), it is not read: that is the fast path that makes status
-// quick. Otherwise it is read and hashed. A FIFO or other special file is
-// never opened: opening a FIFO waits for a writer.
+// quick. Otherwise it is read and hashed; so is a file added with
+// `git add -N`, whose contents the index does not have. A FIFO or other
+// special file is never opened: opening a FIFO waits for a writer.
 func ReadWorktree(r *repo.Repo, ix *index.Index, e *index.Entry) (Worktree, error) {
 	fi, found, err := r.StatTracked(e.Path)
 	switch {
-	case err != nil || !found:
+	case err != nil:
 		return Worktree{}, err
-	case ix.UpToDate(e, fi):
+	case !found:
+		unchanged, err := Missing(r, e)
+		if err != nil || !unchanged {
+			return Worktree{}, err
+		}
+		return Worktree{Exists: true, Mode: e.Mode, Hash: e.Hash}, nil
+	case !e.IntentToAdd && ix.UpToDate(e, fi):
 		return Worktree{Exists: true, Mode: e.Mode, Hash: e.Hash}, nil
 	}
 	return readFile(r, e.Path, fi)

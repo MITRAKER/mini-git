@@ -19,6 +19,7 @@ Everyday commands ("porcelain"):
   add          stage files for the next commit
   status       show staged, unstaged and untracked changes
   commit       save the staged files as a new commit
+  diff         show changes between commits, the index and the files
   log          show the commit history
   branch       list, create or delete branches
   checkout     switch branches, or look at an old commit
@@ -82,6 +83,8 @@ func dispatch(name string, args []string, out *output) (known bool, err error) {
 		return true, runStatus(args, out)
 	case "commit":
 		return true, runCommit(args, out)
+	case "diff":
+		return true, runDiff(args, out)
 	case "log":
 		return true, runLog(args, out)
 	case "branch":
@@ -136,7 +139,11 @@ func exitStatus(name string, err error) int {
 	case errors.Is(err, flag.ErrHelp):
 		return exitUsage // the flag package has printed the usage already
 	case errors.As(err, &usage):
-		fmt.Fprintln(os.Stderr, usage.Error())
+		msg := err.Error()
+		if msg != usage.Error() {
+			msg = "mgit " + name + ": " + msg // what was wrong, then the usage
+		}
+		fmt.Fprintln(os.Stderr, msg)
 		return exitUsage
 	}
 	fmt.Fprintf(os.Stderr, "mgit %s: %v\n", name, err)
@@ -150,6 +157,24 @@ func newFlagSet(name string) *flag.FlagSet {
 
 // findRepo finds the repository the current folder belongs to.
 func findRepo() (*repo.Repo, error) { return repo.Find(".") }
+
+// findWorkTree finds the repository for a command that works on the files
+// of the working tree. Like Git (NEED_WORK_TREE), it refuses to run inside
+// the .git folder, which is not part of the working tree.
+func findWorkTree() (*repo.Repo, error) {
+	r, err := findRepo()
+	if err != nil {
+		return nil, err
+	}
+	_, inWorkTree, err := r.Prefix()
+	switch {
+	case err != nil:
+		return nil, err
+	case !inWorkTree:
+		return nil, repo.ErrNotInWorkTree
+	}
+	return r, nil
+}
 
 // mgit version
 func runVersion(args []string, out *output) error {

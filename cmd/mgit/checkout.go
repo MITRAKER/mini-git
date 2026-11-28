@@ -43,7 +43,7 @@ func runCheckout(args []string, out *output) error {
 	if len(create) > 1 || fs.NArg() > 1 || (len(create) == 0 && fs.NArg() != 1) {
 		return usageError(checkoutUsage)
 	}
-	r, err := findRepo()
+	r, err := findWorkTree()
 	if err != nil {
 		return err
 	}

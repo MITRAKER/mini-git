@@ -101,10 +101,26 @@ func (w *twins) runIn(sub string, args ...string) cmdResult {
 	return m
 }
 
+// commit runs `git commit -q args` in one copy and `mgit commit args` in the
+// other. Both must succeed or both fail, and leave the same state behind:
+// the same new commit, or the same index after a commit that failed.
+func (w *twins) commit(args ...string) {
+	w.t.Helper()
+	g := execIn(w.git, nil, "", "git", append([]string{"commit", "-q"}, args...)...)
+	m := execIn(w.mgit, nil, "", mgitBin, append([]string{"commit"}, args...)...)
+	what := "commit " + strings.Join(args, " ")
+	if (g.err == nil) != (m.err == nil) {
+		w.t.Fatalf("%s: git error %v, mgit error %v\ngit: %s%smgit: %s", what, g.err, m.err, g.stdout, g.stderr, m.stderr)
+	}
+	if gs, ms := snapshot(w.t, w.git), snapshot(w.t, w.mgit); gs != ms {
+		w.t.Errorf("%s: the repositories differ afterwards\ngit:\n%s\nmgit:\n%s", what, gs, ms)
+	}
+}
+
 // snapshot describes everything checkout and branch can change: HEAD (a
 // file, or a symbolic link), the refs (and where symbolic ones point), the
-// index, what status reports, and every file on disk with its type,
-// permissions and contents.
+// index with git's marks (see TestIndexFlagsMatchGit), what status reports,
+// and every file on disk with its type, permissions and contents.
 func snapshot(t *testing.T, dir string) string {
 	t.Helper()
 	var b strings.Builder
@@ -119,7 +135,7 @@ func snapshot(t *testing.T, dir string) string {
 		b.WriteString("HEAD: " + string(data))
 	}
 	b.WriteString(git(t, dir, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"))
-	b.WriteString("index:\n" + git(t, dir, "ls-files", "-s"))
+	b.WriteString("index:\n" + git(t, dir, "ls-files", "-s", "-v"))
 	b.WriteString("status:\n" + git(t, dir, "status", "--porcelain", "--untracked-files=all"))
 	b.WriteString("files:\n")
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
